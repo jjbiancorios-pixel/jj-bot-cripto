@@ -255,16 +255,27 @@ def calc_adx(df, p=14):
     return {"adx": float(adx.iloc[-1]), "plus_di": float(plus_di.iloc[-1]), "minus_di": float(minus_di.iloc[-1])}
 
 
-def patron_vela_score(df) -> int:
-    """Patrón de vela simple (0, 1 o 2 puntos) — parte de la familia momentum topeada."""
+def patron_vela_score(df, direccion: str) -> int:
+    """
+    Patrón de vela (0, 1 o 2 puntos) — parte de la familia momentum topeada.
+
+    04/09 FIX: antes sumaba puntos por cualquier vela con cuerpo fuerte,
+    SIN chequear si esa vela iba en la misma dirección de la señal — una
+    vela bajista fuerte podía sumarle puntos a una candidata LARGO. Ahora
+    exige que la vela confirme la dirección (alcista para LARGO, bajista
+    para CORTO) antes de puntuar.
+    """
     c, o = df["close"].iloc[-1], df["open"].iloc[-1]
     h, l = df["high"].iloc[-1], df["low"].iloc[-1]
+    vela_alcista = c > o
+    if (direccion == "LARGO" and not vela_alcista) or (direccion == "CORTO" and vela_alcista):
+        return 0
     cuerpo = abs(c - o)
     rango_total = h - l
     if rango_total <= 0:
         return 0
     if cuerpo / rango_total > 0.6:
-        return 2  # vela con cuerpo fuerte, dirección clara
+        return 2  # vela con cuerpo fuerte, dirección clara y a favor
     if cuerpo / rango_total > 0.3:
         return 1
     return 0
@@ -335,10 +346,19 @@ def analizar_par(par: str, btc: dict):
     plus_di, minus_di = adx_info["plus_di"], adx_info["minus_di"]
 
     ema20_4h = calc_ema(df4h["close"], 20)
-    ema9_15m = calc_ema(df15["close"], 9)
+    ema9_1h = calc_ema(df1h["close"], 9)
+    ema21_1h = calc_ema(df1h["close"], 21)
 
-    # Dirección candidata: EMA9(15m) vs precio, confirmada por DI
-    direccion = "LARGO" if precio > ema9_15m else "CORTO"
+    # Dirección candidata (04/09, FIX de robustez): antes comparaba precio
+    # vs. EMA9 de 15min (una sola vela, muy sensible al ruido). Ahora usa
+    # el cruce EMA9/EMA21 en 1h — menos ruidoso, timeframe más alto, y una
+    # cruz de 2 medias en vez de precio vs. 1 sola media. Si no hay
+    # dirección clara (EMAs casi pegadas), se descarta el candidato acá
+    # mismo, antes de gastar cómputo en los gates.
+    diferencia_ema_pct = abs(ema9_1h - ema21_1h) / ema21_1h * 100 if ema21_1h > 0 else 0
+    if diferencia_ema_pct < 0.05:  # EMAs casi pegadas, sin tendencia clara en 1h
+        return None
+    direccion = "LARGO" if ema9_1h > ema21_1h else "CORTO"
 
     # ── GATE 1: ADX + DI (umbral diferenciado por tipo de par) ──
     adx_umbral = 23 if par in PARES_MAJORS else 28
@@ -392,7 +412,7 @@ def analizar_par(par: str, btc: dict):
     elif direccion == "CORTO" and bb["pos"] > 0.7:
         score_momentum_bruto += 1; razones.append("Cerca de banda superior Bollinger")
 
-    score_momentum_bruto += patron_vela_score(df15)
+    score_momentum_bruto += patron_vela_score(df15, direccion)
 
     score_momentum = min(SCORE_MOMENTUM_TOPE, score_momentum_bruto)
 
@@ -407,10 +427,11 @@ def analizar_par(par: str, btc: dict):
     elif btc["estado"] == "LATERAL":
         score_independiente += 1; razones.append("BTC lateral (neutro)")
 
-    # Confirmación 1h
-    ema9_1h = calc_ema(df1h["close"], 9)
-    if (direccion == "LARGO" and precio > ema9_1h) or (direccion == "CORTO" and precio < ema9_1h):
-        score_independiente += 1; razones.append("Confirma en 1h")
+    # Confirmación 1h — 04/09: cambiado a EMA21 (no EMA9) porque EMA9(1h)
+    # ya se usa para determinar la dirección candidata más arriba; usar la
+    # misma EMA de nuevo acá sería redundante (mismo dato contado 2 veces).
+    if (direccion == "LARGO" and precio > ema21_1h) or (direccion == "CORTO" and precio < ema21_1h):
+        score_independiente += 1; razones.append("Confirma en 1h (por encima/debajo de EMA21)")
 
     # Volumen (umbral 1.5x)
     vol_prom = df15["vol"].iloc[-21:-1].mean()
