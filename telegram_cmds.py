@@ -152,6 +152,33 @@ def _cmd_backup_db() -> str:
         return f"⚠️ Error: {e}"
 
 
+def _cmd_debug_orden(args: list) -> str:
+    """
+    04/09 — Diagnóstico: muestra la respuesta CRUDA de Pionex para la
+    posición abierta de un par, para confirmar los nombres reales de
+    campos (marginBalance, initUsdtInvestment, quoteInvestment, etc.)
+    antes de confiar en un cálculo automático con capital real.
+    Uso: /debug_orden PAR
+    """
+    if not args:
+        return "Uso: /debug_orden PAR\nEj: /debug_orden TAO"
+    par = args[0].upper().strip()
+    if not par.endswith("USDT"):
+        par += "USDT"
+
+    abiertas = db.posiciones_abiertas()
+    senal = next((s for s in abiertas if s["par"] == par), None)
+    if not senal or not senal.get("bu_order_id"):
+        return f"⚠️ No encontré una posición abierta de {par} con bu_order_id."
+
+    try:
+        import pionex_api
+        resultado = pionex_api.consultar_orden(senal["bu_order_id"])
+        return f"🔍 <b>Debug — {par}</b>\nbu_order_id: {senal['bu_order_id']}\n\n<code>{resultado}</code>"
+    except Exception as e:
+        return f"⚠️ Error: {e}"
+
+
 def _cmd_gates(args: list) -> str:
     if not args:
         return "Uso: /gates PAR\nEj: /gates BTC"
@@ -197,6 +224,8 @@ def procesar_comando(texto: str) -> str:
         return _cmd_backup_db()
     elif cmd == "/gates":
         return _cmd_gates(args)
+    elif cmd == "/debug_orden":
+        return _cmd_debug_orden(args)
     elif cmd in ("/ayuda", "/help", "/start"):
         return (
             "🤖 <b>Bot Cripto v2 — Comandos</b>\n\n"
@@ -204,6 +233,7 @@ def procesar_comando(texto: str) -> str:
             "/pendientes — posiciones abiertas ahora, con pico y tramo de trailing\n"
             "/capital — capital del día (interés compuesto)\n"
             "/gates PAR — últimos 10 chequeos de gates para un par (diagnóstico)\n"
+            "/debug_orden PAR — respuesta cruda de Pionex para una posición (diagnóstico)\n"
             "/pausar_todo [motivo] — frena aperturas nuevas (SL/trailing sigue activo)\n"
             "/reanudar_todo\n"
             "/probar_pionex PAR PRECIO — prueba conexión sin crear orden real\n"

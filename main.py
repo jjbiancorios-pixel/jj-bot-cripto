@@ -521,6 +521,7 @@ def chequeo_rapido_riesgo():
             for senal in abiertas:
                 resultado_pct = pionex_api.calcular_resultado_actual(senal["bu_order_id"])
                 if resultado_pct is None:
+                    print(f"⚠️ chequeo_rapido_riesgo: resultado_pct=None para {senal['par']} (bu_order_id={senal['bu_order_id']}) — revisar con /debug_orden")
                     continue
 
                 db.actualizar_mae_mfe(senal["id"], resultado_pct)
@@ -541,12 +542,8 @@ def chequeo_rapido_riesgo():
 # ── Huérfanas — cada 30 min ──────────────────────────────────
 def chequear_huerfanas():
     try:
-        reales = pionex_api.listar_grillas_abiertas()
-        ids_reales = set()
-        for g in reales.get("data", {}).get("orders", []) or reales.get("data", {}).get("results", []):
-            oid = g.get("buOrderId") or g.get("orderId")
-            if oid:
-                ids_reales.add(str(oid))
+        reales = pionex_api.listar_grillas_abiertas()  # ya devuelve la lista filtrada
+        ids_reales = {str(g.get("buOrderId")) for g in reales if g.get("buOrderId")}
 
         nuestras = db.posiciones_abiertas()
         for senal in nuestras:

@@ -275,18 +275,39 @@ def cerrar_grilla_futuros(bu_order_id: str, nota: str = "Cierre por SL/trailing"
     return resp.json()
 
 
-def listar_grillas_abiertas() -> dict:
+def listar_grillas_abiertas() -> list:
     """
-    GET /futuresGrid — lista TODAS las grillas reales abiertas en la
-    cuenta. Usado por el chequeo de huérfanas (cada 30 min): cruza esta
-    lista real contra lo que nuestra base cree que está abierto.
+    GET /bot/orders — lista TODAS las grillas reales abiertas en la
+    cuenta. Usado por el chequeo de huérfanas (cada 30 min).
+
+    04/09 (bug real detectado en producción): usaba el endpoint
+    /futuresGrid que no existe/no filtra bien — corregido al endpoint
+    confirmado en v16/v18: /api/v1/bot/orders, SIN type= en la query
+    (eso causa INVALID_SIGNATURE), filtrando client-side por
+    buOrderType=="futures_grid" y status running/trading. El campo real
+    de la respuesta es "results", no "orders" como se había asumido
+    antes sin confirmar.
+    Devuelve una LISTA ya filtrada (no el dict crudo).
     """
-    path = "/api/v1/bot/orders/futuresGrid"
+    path = "/api/v1/bot/orders"
     timestamp, firma = _firmar("GET", path, "")
     headers = {"PIONEX-KEY": PIONEX_API_KEY, "PIONEX-SIGNATURE": firma}
     url = f"{PIONEX_BASE_URL}{path}?timestamp={timestamp}"
-    resp = requests.get(url, headers=headers, timeout=15)
-    return resp.json()
+    try:
+        resp = requests.get(url, headers=headers, timeout=15)
+        data = resp.json()
+        if not data.get("result"):
+            print(f"⚠️ listar_grillas_abiertas: Pionex respondió result=false: {str(data)[:200]}")
+            return []
+        ordenes = data.get("data", {}).get("results", [])
+        return [
+            o for o in ordenes
+            if o.get("buOrderType") == "futures_grid"
+            and str(o.get("status", "")).lower() in ("running", "trading")
+        ]
+    except Exception as e:
+        print(f"⚠️ listar_grillas_abiertas: error de conexión: {e}")
+        return []
 
 
 def obtener_balance_cuenta() -> float:
