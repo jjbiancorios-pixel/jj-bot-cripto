@@ -519,7 +519,11 @@ def chequeo_rapido_riesgo():
         try:
             abiertas = db.posiciones_abiertas()
             for senal in abiertas:
-                resultado_pct = pionex_api.calcular_resultado_actual(senal["bu_order_id"])
+                precio_actual = get_precio(senal["par"])
+                if precio_actual is None:
+                    print(f"⚠️ chequeo_rapido_riesgo: no se pudo obtener precio de cascada para {senal['par']} — se salta este ciclo")
+                    continue
+                resultado_pct = pionex_api.calcular_resultado_actual(senal["bu_order_id"], precio_actual)
                 if resultado_pct is None:
                     print(f"⚠️ chequeo_rapido_riesgo: resultado_pct=None para {senal['par']} (bu_order_id={senal['bu_order_id']}) — revisar con /debug_orden")
                     continue
@@ -529,6 +533,19 @@ def chequeo_rapido_riesgo():
                 decision = gestion_riesgo.evaluar_cierre(senal, resultado_pct)
                 if decision["cerrar"]:
                     cierre = pionex_api.cerrar_grilla_futuros(senal["bu_order_id"], nota=decision["motivo"])
+                    if not cierre["ok"]:
+                        # 04/09 FIX CRÍTICO: si Pionex rechazó el cierre, la
+                        # posición NUNCA se marca como cerrada acá — sigue en
+                        # posiciones_abiertas() y se reintenta cerrar en el
+                        # próximo ciclo (2seg). Antes esto quedaba invisible
+                        # y la posición real seguía corriendo sin control.
+                        telegram_cmds.enviar(
+                            f"🚨 <b>{senal['par']}: Pionex RECHAZÓ el cierre</b> (motivo: {decision['motivo']})\n"
+                            f"Resultado calculado: {resultado_pct:+.2f}% | Reintentando cada 2seg — "
+                            f"si esto persiste, CERRAR MANUALMENTE en la app.\n"
+                            f"<code>{str(cierre['resultado'])[:250]}</code>"
+                        )
+                        continue
                     db.cerrar_senal(senal["id"], resultado_pct, decision["motivo"])
                     telegram_cmds.enviar(
                         f"{'🟢' if resultado_pct > 0 else '🔴'} <b>{senal['par']} cerrado</b> ({decision['motivo']})\n"

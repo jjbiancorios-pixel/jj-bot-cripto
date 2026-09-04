@@ -34,11 +34,19 @@ import time
 import hmac
 import hashlib
 import json
+import threading
 import requests
 
 PIONEX_BASE_URL = "https://api.pionex.com"
 PIONEX_API_KEY = os.environ.get("PIONEX_API_KEY", "")
 PIONEX_API_SECRET = os.environ.get("PIONEX_API_SECRET", "")
+
+# 04/09 — Pionex recomienda serializar las llamadas de ESCRITURA (crear/
+# cerrar) por cuenta: con el ciclo de apertura (cada 15min) y el chequeo
+# de cierre (cada 2seg) corriendo en hilos paralelos, hay riesgo real de
+# condición de carrera si ambos escriben a la vez. Mismo fix ya aplicado
+# en v18 el 27/08.
+_pionex_write_lock = threading.Lock()
 
 # Comisión real de Pionex Futuros: 0.02% maker / 0.05% taker (confirmado
 # en múltiples fuentes públicas, Pionex no tiene endpoint propio de fees).
@@ -199,8 +207,9 @@ def crear_grilla_futuros(par: str, top: float, bottom: float, row: int,
     timestamp, firma = _firmar("POST", path, "", body_json)
     headers = {"PIONEX-KEY": PIONEX_API_KEY, "PIONEX-SIGNATURE": firma, "Content-Type": "application/json"}
     url = f"{PIONEX_BASE_URL}{path}?timestamp={timestamp}"
-    resp = requests.post(url, headers=headers, data=body_json, timeout=15)
-    return resp.json()
+    with _pionex_write_lock:
+        resp = requests.post(url, headers=headers, data=body_json, timeout=15)
+        return resp.json()
 
 
 def consultar_orden(bu_order_id: str) -> dict:
@@ -214,13 +223,28 @@ def consultar_orden(bu_order_id: str) -> dict:
     return resp.json()
 
 
-def calcular_resultado_actual(bu_order_id: str):
+def calcular_resultado_actual(bu_order_id: str, precio_actual: float):
     """
-    % de resultado REAL de una posición abierta ahora mismo:
-    (marginBalance - initUsdtInvestment) / quoteInvestment * 100
-    (fórmula validada con datos reales en v16, incluye lo acumulado por
-    el grid — bug histórico: NO usar solo el movimiento de precio crudo,
-    subestima el resultado real cuando el grid acumuló posición)
+    % de resultado REAL de una posición abierta ahora mismo.
+
+    04/09 — FIX CRÍTICO (repite un bug ya corregido en v16 el 07/08, que
+    yo mismo reintroduje sin darme cuenta porque copié el pionex_api.py
+    de referencia del proyecto, que resultó ser la versión DE ANTES del
+    fix): usar solo marginBalance NO alcanza — no refleja en tiempo real
+    la ganancia/pérdida NO REALIZADA de la posición que el grid ya
+    compró (baseAmount). Caso real que lo confirmó: ONDOUSDT cerró
+    manualmente en -4,91% real (visto en la app de Pionex) mientras nuestro
+    cálculo (solo marginBalance) nunca bajó de -4% — el SL nunca se
+    disparó a tiempo, exactamente el mismo patrón del bug de INJUSDT (v16).
+
+    Fórmula correcta (validada entonces contra 3 números reales de INJ):
+      resultado% = (marginBalance - initUsdtInvestment) / quoteInvestment * 100
+                   + baseAmount * (precio_actual - positionOpenPrice) / quoteInvestment * 100
+    baseAmount ya viene con signo (negativo en CORTO), así que la fórmula
+    es la misma para LARGO y CORTO sin necesidad de una rama aparte.
+
+    precio_actual: se pasa desde afuera (cascada externa, gratis) para no
+    sumar una consulta directa más a Pionex solo para esto.
     """
     data = consultar_orden(bu_order_id).get("data", {}) or {}
     bod = data.get("buOrderData", {}) or {}
@@ -230,7 +254,14 @@ def calcular_resultado_actual(bu_order_id: str):
         quote_investment = float(bod.get("quoteInvestment") or bod.get("initQuoteInvestment") or 0)
         if quote_investment <= 0:
             return None
-        return round((margin_balance - init_investment) / quote_investment * 100, 4)
+
+        base_amount = float(bod.get("baseAmount", 0) or 0)
+        position_open_price = float(bod.get("positionOpenPrice", 0) or 0)
+        no_realizado_usd = base_amount * (precio_actual - position_open_price) if position_open_price > 0 else 0.0
+
+        resultado_base_pct = (margin_balance - init_investment) / quote_investment * 100
+        resultado_no_realizado_pct = no_realizado_usd / quote_investment * 100
+        return round(resultado_base_pct + resultado_no_realizado_pct, 4)
     except (ValueError, TypeError):
         return None
 
@@ -261,18 +292,50 @@ def esta_cerrada(bu_order_id: str) -> dict:
 
 
 def cerrar_grilla_futuros(bu_order_id: str, nota: str = "Cierre por SL/trailing") -> dict:
-    """POST /futuresGrid/cancel — cierra una grilla YA ABIERTA (usado por SL fijo y trailing TP)."""
+    """
+    POST /futuresGrid/cancel — cierra una grilla YA ABIERTA.
+
+    04/09 — FIX CRÍTICO (mismo bug ya corregido en v18 el 19/08, que
+    reintroduje al escribir esto desde cero sin verificar contra el
+    historial): se sacó "immediate": True — según la documentación
+    oficial, ese flag es una recuperación especial SOLO válida cuando la
+    orden ya está en estado close_position con un límite TP/SL trabado
+    sin llenar. En cualquier posición corriendo normalmente (nuestro
+    caso siempre), Pionex lo RECHAZA con "Forbidden: invalid status" —
+    y como antes no se chequeaba el resultado, ese rechazo quedaba
+    invisible: la posición se marcaba "cerrada" en nuestra base
+    (dejando de monitorearla) mientras seguía corriendo real en Pionex
+    sin nadie vigilándola. Esto explica el patrón real visto el 04/09:
+    4 de 6 posiciones cerraron con pérdidas superiores al 5% pese al SL
+    fijo de -4% — el SL se disparaba a tiempo, pero el cierre real
+    fallaba en silencio y la posición seguía cayendo sin control.
+
+    Ahora SIEMPRE devuelve {"ok": bool, "resultado": ...} — el llamador
+    (main.py) NUNCA debe marcar una posición como cerrada en nuestra
+    base si "ok" es False.
+    """
     path = "/api/v1/bot/orders/futuresGrid/cancel"
     body_dict = {
-        "buOrderId": bu_order_id, "closeNote": nota,
-        "closeSellModel": "TO_QUOTE", "immediate": True, "closeSlippage": "0.01",
+        "buOrderId": bu_order_id,
+        "closeNote": nota,
+        "closeSellModel": "TO_QUOTE",
+        "closeSlippage": "0.01",
     }
     body_json = json.dumps(body_dict, separators=(",", ":"))
     timestamp, firma = _firmar("POST", path, "", body_json)
     headers = {"PIONEX-KEY": PIONEX_API_KEY, "PIONEX-SIGNATURE": firma, "Content-Type": "application/json"}
     url = f"{PIONEX_BASE_URL}{path}?timestamp={timestamp}"
-    resp = requests.post(url, headers=headers, data=body_json, timeout=15)
-    return resp.json()
+    try:
+        with _pionex_write_lock:
+            resp = requests.post(url, headers=headers, data=body_json, timeout=15)
+            data = resp.json()
+        ok = bool(data.get("result"))
+        if not ok:
+            print(f"⚠️ cerrar_grilla_futuros: Pionex RECHAZÓ el cierre de {bu_order_id}: {str(data)[:300]}")
+        return {"ok": ok, "resultado": data}
+    except Exception as e:
+        print(f"⚠️ cerrar_grilla_futuros: error de conexión al cerrar {bu_order_id}: {e}")
+        return {"ok": False, "resultado": str(e)}
 
 
 def listar_grillas_abiertas() -> list:
