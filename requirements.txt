@@ -1,0 +1,4 @@
+requests==2.31.0
+pandas==2.2.2
+numpy==1.26.4
+schedule==1.2.1

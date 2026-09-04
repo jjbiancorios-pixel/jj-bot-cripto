@@ -1,0 +1,310 @@
+"""
+pionex_api.py — Bot Cripto (rediseño desde cero)
+──────────────────────────────────────────────────
+Cliente para la API de Pionex — Futures Grid Bot.
+
+Basado en la documentación oficial (mismo esquema de firma que v18,
+confirmado funcionando en producción):
+https://www.pionex.com/docs/api-docs/bot-api/futures-grid
+
+REGLAS DE SEGURIDAD DE ESTE DISEÑO (confirmadas 01-04/09/2026):
+1. MONTO MÍNIMO DINÁMICO — Pionex confirmó por soporte (01/09) que
+   checkParams puede dar OK y create fallar después, porque el mínimo
+   de inversión se recalcula según precio/leverage en el momento exacto.
+   Por eso: SIEMPRE se llama a checkParams sin cachear, JUSTO antes de
+   create, y el monto usado es el MAYOR entre el objetivo calculado y
+   (mínimo dinámico + margen de seguridad 20-30%).
+2. COMISIÓN vs. CANTIDAD DE GRILLAS — no existe API de Pionex que
+   recomiende la cantidad de grillas. Se calcula con una fórmula propia
+   (rango% / paso objetivo), pero el paso NUNCA puede ser menor a 3x la
+   comisión ida+vuelta estimada — si no, se reduce la cantidad de
+   grillas (escalones más anchos) para no perder plata en comisiones.
+3. SL/TRAILING — consulta DIRECTA a Pionex (no cascada), cada 2 seg por
+   posición. Se asumió el riesgo de HTTP 429 sin confirmar el límite
+   real con Pionex (decisión de Juanjo, 01/09).
+
+IMPORTANTE antes de producción:
+- API Key con permiso de TRADE únicamente (sin retiro)
+- Whitelist de IP con la IP saliente de Railway
+- PIONEX_API_KEY y PIONEX_API_SECRET cargadas como Variables en Railway
+  (mismos nombres que v18, confirmado por Juanjo)
+"""
+import os
+import time
+import hmac
+import hashlib
+import json
+import requests
+
+PIONEX_BASE_URL = "https://api.pionex.com"
+PIONEX_API_KEY = os.environ.get("PIONEX_API_KEY", "")
+PIONEX_API_SECRET = os.environ.get("PIONEX_API_SECRET", "")
+
+# Comisión real de Pionex Futuros: 0.02% maker / 0.05% taker (confirmado
+# en múltiples fuentes públicas, Pionex no tiene endpoint propio de fees).
+# Estimación conservadora ida+vuelta:
+COMISION_IDA_VUELTA_PCT = 0.10
+
+# Margen de seguridad sobre el mínimo dinámico de Pionex (nota oficial
+# de soporte, 01/09/2026 — checkParams puede dar OK y create fallar
+# después porque el mínimo cambia con el precio en el medio)
+MARGEN_SOBRE_MINIMO_PCT = 0.25  # 25%, punto medio del rango 20-30% acordado
+
+
+def _firmar(method: str, path: str, query: str, body: str = "") -> tuple:
+    """
+    Genera timestamp (ms) y firma HMAC-SHA256 según especificación de Pionex.
+    GET           -> METHOD + PATH_URL + QUERY + TIMESTAMP
+    POST / DELETE -> METHOD + PATH_URL + QUERY + TIMESTAMP + BODY
+    """
+    if not PIONEX_API_SECRET:
+        raise RuntimeError("PIONEX_API_SECRET no configurada (falta variable en Railway).")
+
+    timestamp = str(int(time.time() * 1000))
+    query_completa = f"{query}&timestamp={timestamp}" if query else f"timestamp={timestamp}"
+    payload = f"{method}{path}?{query_completa}"
+    if method in ("POST", "DELETE"):
+        payload += body
+
+    firma = hmac.new(
+        PIONEX_API_SECRET.encode("utf-8"),
+        payload.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    return timestamp, firma
+
+
+def obtener_precision_par(par: str) -> int:
+    """Consulta GET /common/symbols para la precisión de precio (decimales) de este par."""
+    base = par.upper().replace("USDT", "").replace(".PERP", "")
+    symbol = f"{base}_USDT_PERP"
+    path = "/api/v1/common/symbols"
+    query = f"symbols={symbol}&type=PERP"
+    timestamp, firma = _firmar("GET", path, query)
+    headers = {"PIONEX-KEY": PIONEX_API_KEY, "PIONEX-SIGNATURE": firma}
+    url = f"{PIONEX_BASE_URL}{path}?{query}&timestamp={timestamp}"
+    try:
+        resp = requests.get(url, headers=headers, timeout=10).json()
+        symbols_list = resp.get("data", {}).get("symbols", [])
+        if symbols_list:
+            return int(symbols_list[0].get("quotePrecision", 4))
+    except Exception:
+        pass
+    return 4
+
+
+def _armar_body(par: str, top: float, bottom: float, row: int,
+                 capital_usdt: float, leverage: int, trend: str = "long",
+                 grid_type: str = "arithmetic") -> dict:
+    base = par.upper().replace("USDT", "").replace(".PERP", "")
+    precision = obtener_precision_par(base)
+    bu_order_data = {
+        "top": str(round(top, precision)),
+        "bottom": str(round(bottom, precision)),
+        "row": row,
+        "grid_type": grid_type,
+        "trend": trend,
+        "leverage": leverage,
+        "quoteInvestment": str(round(capital_usdt, 2)),
+        "investmentFrom": "USER",
+    }
+    return {"base": f"{base}.PERP", "quote": "USDT", "buOrderData": bu_order_data}
+
+
+def validar_parametros_grilla(par: str, top: float, bottom: float, row: int,
+                               capital_usdt: float, leverage: int = 10,
+                               trend: str = "long", grid_type: str = "arithmetic") -> dict:
+    """
+    POST /futuresGrid/checkParams — NO crea orden real. Valida rango,
+    capital mínimo/máximo. SIEMPRE llamar sin cachear, justo antes de
+    crear_grilla_futuros_segura() — el mínimo cambia con el precio.
+    """
+    path = "/api/v1/bot/orders/futuresGrid/checkParams"
+    body_dict = _armar_body(par, top, bottom, row, capital_usdt, leverage, trend, grid_type)
+    bod = body_dict["buOrderData"]
+    bod_snake = {
+        "top": bod["top"], "bottom": bod["bottom"], "row": bod["row"],
+        "grid_type": bod["grid_type"], "trend": bod["trend"], "leverage": bod["leverage"],
+        "quote_investment": bod["quoteInvestment"], "extra_margin": False,
+    }
+    body_dict["buOrderData"] = bod_snake
+    body_json = json.dumps(body_dict, separators=(",", ":"))
+    timestamp, firma = _firmar("POST", path, "", body_json)
+    headers = {"PIONEX-KEY": PIONEX_API_KEY, "PIONEX-SIGNATURE": firma, "Content-Type": "application/json"}
+    url = f"{PIONEX_BASE_URL}{path}?timestamp={timestamp}"
+    resp = requests.post(url, headers=headers, data=body_json, timeout=15)
+    return resp.json()
+
+
+def _extraer_minimo_del_error(resp: dict):
+    """
+    Intenta extraer el monto mínimo dinámico del mensaje de error de
+    checkParams (Pionex lo incluye en texto, ej: "...minimum is 17.69...").
+    Devuelve None si no se pudo extraer (el llamador debe manejar ese caso).
+    """
+    import re
+    mensaje = str(resp.get("message") or resp.get("data") or resp)
+    match = re.search(r"(\d+\.?\d*)", mensaje)
+    if match:
+        try:
+            return float(match.group(1))
+        except ValueError:
+            return None
+    return None
+
+
+def crear_grilla_futuros_segura(par: str, top: float, bottom: float, row: int,
+                                 capital_objetivo_usdt: float, leverage: int,
+                                 trend: str = "long", grid_type: str = "arithmetic",
+                                 max_reintentos: int = 2) -> dict:
+    """
+    Apertura REAL con la verificación de mínimo dinámico incluida:
+    1. checkParams sin cachear con el monto objetivo
+    2. Si Pionex rechaza por mínimo, extrae el mínimo real del error,
+       reintenta con mínimo + margen de seguridad (25%)
+    3. Solo si checkParams pasa, se llama a create
+
+    Devuelve dict con "ok": bool, "resultado": respuesta cruda de Pionex,
+    "capital_usado": el monto final que se intentó usar.
+    """
+    capital_actual = capital_objetivo_usdt
+    intentos = 0
+    while intentos <= max_reintentos:
+        intentos += 1
+        check = validar_parametros_grilla(par, top, bottom, row, capital_actual, leverage, trend, grid_type)
+        if check.get("result") is True or check.get("code") == 0 or check.get("data"):
+            # checkParams OK -> crear de verdad, INMEDIATAMENTE (sin demora que permita que el mínimo vuelva a moverse)
+            resultado = crear_grilla_futuros(par, top, bottom, row, capital_actual, leverage, trend, grid_type)
+            ok = resultado.get("result") is True or resultado.get("code") == 0
+            return {"ok": ok, "resultado": resultado, "capital_usado": capital_actual, "intentos": intentos}
+
+        # checkParams falló -> ¿es por monto mínimo? intentar extraer y reintentar con margen
+        minimo_extraido = _extraer_minimo_del_error(check)
+        if minimo_extraido and minimo_extraido > capital_actual:
+            capital_actual = round(minimo_extraido * (1 + MARGEN_SOBRE_MINIMO_PCT), 2)
+            continue  # reintenta con el monto corregido
+        # Falló por otro motivo, o no se pudo extraer el mínimo -> no insistir a ciegas
+        return {"ok": False, "resultado": check, "capital_usado": capital_actual, "intentos": intentos}
+
+    return {"ok": False, "resultado": check, "capital_usado": capital_actual, "intentos": intentos}
+
+
+def crear_grilla_futuros(par: str, top: float, bottom: float, row: int,
+                          capital_usdt: float, leverage: int = 10,
+                          trend: str = "long", grid_type: str = "arithmetic") -> dict:
+    """POST /futuresGrid/create — crea una grilla REAL. Usar vía crear_grilla_futuros_segura(), no directo."""
+    path = "/api/v1/bot/orders/futuresGrid/create"
+    body_dict = _armar_body(par, top, bottom, row, capital_usdt, leverage, trend, grid_type)
+    body_json = json.dumps(body_dict, separators=(",", ":"))
+    timestamp, firma = _firmar("POST", path, "", body_json)
+    headers = {"PIONEX-KEY": PIONEX_API_KEY, "PIONEX-SIGNATURE": firma, "Content-Type": "application/json"}
+    url = f"{PIONEX_BASE_URL}{path}?timestamp={timestamp}"
+    resp = requests.post(url, headers=headers, data=body_json, timeout=15)
+    return resp.json()
+
+
+def consultar_orden(bu_order_id: str) -> dict:
+    """GET /futuresGrid/order — estado completo: resultado, liquidationPrice, status, etc."""
+    path = "/api/v1/bot/orders/futuresGrid/order"
+    query = f"buOrderId={bu_order_id}"
+    timestamp, firma = _firmar("GET", path, query)
+    headers = {"PIONEX-KEY": PIONEX_API_KEY, "PIONEX-SIGNATURE": firma}
+    url = f"{PIONEX_BASE_URL}{path}?{query}&timestamp={timestamp}"
+    resp = requests.get(url, headers=headers, timeout=15)
+    return resp.json()
+
+
+def calcular_resultado_actual(bu_order_id: str):
+    """
+    % de resultado REAL de una posición abierta ahora mismo:
+    (marginBalance - initUsdtInvestment) / quoteInvestment * 100
+    (fórmula validada con datos reales en v16, incluye lo acumulado por
+    el grid — bug histórico: NO usar solo el movimiento de precio crudo,
+    subestima el resultado real cuando el grid acumuló posición)
+    """
+    data = consultar_orden(bu_order_id).get("data", {}) or {}
+    bod = data.get("buOrderData", {}) or {}
+    try:
+        margin_balance = float(bod.get("marginBalance", 0) or 0)
+        init_investment = float(bod.get("initUsdtInvestment", 0) or 0)
+        quote_investment = float(bod.get("quoteInvestment") or bod.get("initQuoteInvestment") or 0)
+        if quote_investment <= 0:
+            return None
+        return round((margin_balance - init_investment) / quote_investment * 100, 4)
+    except (ValueError, TypeError):
+        return None
+
+
+def esta_cerrada(bu_order_id: str) -> dict:
+    """Detecta si una grilla ya cerró (TP, cancelación, liquidación) y su resultado real."""
+    data = consultar_orden(bu_order_id).get("data", {}) or {}
+    bod = data.get("buOrderData", {}) or {}
+    status_top = (data.get("status") or "").lower()
+    status_bod = (bod.get("status") or "").lower()
+    reason = bod.get("reasonBy")
+
+    cerrada = status_top in ("finished", "closed", "cancelled", "canceled") or \
+              status_bod in ("finished", "closed", "cancelled", "canceled", "stopped")
+
+    resultado_pct = None
+    if cerrada:
+        try:
+            margin_balance = float(bod.get("marginBalance", 0) or 0)
+            init_investment = float(bod.get("initUsdtInvestment", 0) or 0)
+            quote_investment = float(bod.get("quoteInvestment") or bod.get("initQuoteInvestment") or 0)
+            if quote_investment > 0:
+                resultado_pct = round((margin_balance - init_investment) / quote_investment * 100, 4)
+        except (ValueError, TypeError):
+            resultado_pct = None
+
+    return {"cerrada": cerrada, "motivo": reason, "resultado_pct": resultado_pct}
+
+
+def cerrar_grilla_futuros(bu_order_id: str, nota: str = "Cierre por SL/trailing") -> dict:
+    """POST /futuresGrid/cancel — cierra una grilla YA ABIERTA (usado por SL fijo y trailing TP)."""
+    path = "/api/v1/bot/orders/futuresGrid/cancel"
+    body_dict = {
+        "buOrderId": bu_order_id, "closeNote": nota,
+        "closeSellModel": "TO_QUOTE", "immediate": True, "closeSlippage": "0.01",
+    }
+    body_json = json.dumps(body_dict, separators=(",", ":"))
+    timestamp, firma = _firmar("POST", path, "", body_json)
+    headers = {"PIONEX-KEY": PIONEX_API_KEY, "PIONEX-SIGNATURE": firma, "Content-Type": "application/json"}
+    url = f"{PIONEX_BASE_URL}{path}?timestamp={timestamp}"
+    resp = requests.post(url, headers=headers, data=body_json, timeout=15)
+    return resp.json()
+
+
+def listar_grillas_abiertas() -> dict:
+    """
+    GET /futuresGrid — lista TODAS las grillas reales abiertas en la
+    cuenta. Usado por el chequeo de huérfanas (cada 30 min): cruza esta
+    lista real contra lo que nuestra base cree que está abierto.
+    """
+    path = "/api/v1/bot/orders/futuresGrid"
+    timestamp, firma = _firmar("GET", path, "")
+    headers = {"PIONEX-KEY": PIONEX_API_KEY, "PIONEX-SIGNATURE": firma}
+    url = f"{PIONEX_BASE_URL}{path}?timestamp={timestamp}"
+    resp = requests.get(url, headers=headers, timeout=15)
+    return resp.json()
+
+
+def obtener_balance_cuenta() -> float:
+    """
+    GET /account/balances — balance real de la cuenta, SOLO en USDT.
+    Usado para el recálculo diario de capital de BOT CRIPTO (interés
+    compuesto). Aislamiento de capital entre cinturones: Juanjo mantiene
+    fondos en USDT (Bot Cripto) y en BTC (PAXG) en la misma cuenta de
+    Pionex — esta función filtra explícitamente coin=="USDT" y NUNCA
+    toca el balance en BTC, que es capital exclusivo de PAXG (04/09).
+    """
+    path = "/api/v1/account/balances"
+    timestamp, firma = _firmar("GET", path, "")
+    headers = {"PIONEX-KEY": PIONEX_API_KEY, "PIONEX-SIGNATURE": firma}
+    url = f"{PIONEX_BASE_URL}{path}?timestamp={timestamp}"
+    resp = requests.get(url, headers=headers, timeout=15).json()
+    balances = resp.get("data", {}).get("balances", [])
+    for b in balances:
+        if b.get("coin") == "USDT":
+            return float(b.get("free", 0) or 0) + float(b.get("frozen", 0) or 0)
+    return 0.0
