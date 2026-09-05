@@ -103,7 +103,7 @@ def obtener_precision_par(par: str) -> int:
 
 def _armar_body(par: str, top: float, bottom: float, row: int,
                  capital_usdt: float, leverage: int, trend: str = "long",
-                 grid_type: str = "arithmetic") -> dict:
+                 grid_type: str = "arithmetic", sl_pct: float = None) -> dict:
     base = par.upper().replace("USDT", "").replace(".PERP", "")
     precision = obtener_precision_par(base)
     bu_order_data = {
@@ -116,25 +116,40 @@ def _armar_body(par: str, top: float, bottom: float, row: int,
         "quoteInvestment": str(round(capital_usdt, 2)),
         "investmentFrom": "USER",
     }
+    if sl_pct is not None:
+        # 04/09 — SL NATIVO como respaldo de Pionex, además de nuestro
+        # propio monitoreo activo (que sigue siendo el único que maneja
+        # el trailing TP por pico — Pionex no puede hacer eso solo).
+        # OJO con el formato: Pionex espera la FRACCIÓN DECIMAL (-0.04
+        # para -4%), NO el número de porcentaje (-4.0) — bug real ya
+        # encontrado y corregido en v18 el 29/08 (SL nativo se mandaba
+        # como -1500% por no dividir entre 100). sl_pct llega en formato
+        # "número de porcentaje" (ej. -4.0), se divide acá.
+        bu_order_data["lossStopType"] = "profit_ratio"
+        bu_order_data["lossStop"] = str(round(sl_pct / 100, 4))
     return {"base": f"{base}.PERP", "quote": "USDT", "buOrderData": bu_order_data}
 
 
 def validar_parametros_grilla(par: str, top: float, bottom: float, row: int,
                                capital_usdt: float, leverage: int = 10,
-                               trend: str = "long", grid_type: str = "arithmetic") -> dict:
+                               trend: str = "long", grid_type: str = "arithmetic",
+                               sl_pct: float = None) -> dict:
     """
     POST /futuresGrid/checkParams — NO crea orden real. Valida rango,
     capital mínimo/máximo. SIEMPRE llamar sin cachear, justo antes de
     crear_grilla_futuros_segura() — el mínimo cambia con el precio.
     """
     path = "/api/v1/bot/orders/futuresGrid/checkParams"
-    body_dict = _armar_body(par, top, bottom, row, capital_usdt, leverage, trend, grid_type)
+    body_dict = _armar_body(par, top, bottom, row, capital_usdt, leverage, trend, grid_type, sl_pct)
     bod = body_dict["buOrderData"]
     bod_snake = {
         "top": bod["top"], "bottom": bod["bottom"], "row": bod["row"],
         "grid_type": bod["grid_type"], "trend": bod["trend"], "leverage": bod["leverage"],
         "quote_investment": bod["quoteInvestment"], "extra_margin": False,
     }
+    if "lossStop" in bod:
+        bod_snake["loss_stop_type"] = bod["lossStopType"]
+        bod_snake["loss_stop"] = bod["lossStop"]
     body_dict["buOrderData"] = bod_snake
     body_json = json.dumps(body_dict, separators=(",", ":"))
     timestamp, firma = _firmar("POST", path, "", body_json)
@@ -142,6 +157,8 @@ def validar_parametros_grilla(par: str, top: float, bottom: float, row: int,
     url = f"{PIONEX_BASE_URL}{path}?timestamp={timestamp}"
     resp = requests.post(url, headers=headers, data=body_json, timeout=15)
     return resp.json()
+
+
 
 
 def _extraer_minimo_del_error(resp: dict):
@@ -164,13 +181,16 @@ def _extraer_minimo_del_error(resp: dict):
 def crear_grilla_futuros_segura(par: str, top: float, bottom: float, row: int,
                                  capital_objetivo_usdt: float, leverage: int,
                                  trend: str = "long", grid_type: str = "arithmetic",
-                                 max_reintentos: int = 2) -> dict:
+                                 sl_pct: float = None, max_reintentos: int = 2) -> dict:
     """
     Apertura REAL con la verificación de mínimo dinámico incluida:
     1. checkParams sin cachear con el monto objetivo
     2. Si Pionex rechaza por mínimo, extrae el mínimo real del error,
        reintenta con mínimo + margen de seguridad (25%)
     3. Solo si checkParams pasa, se llama a create
+
+    sl_pct: SL nativo de respaldo (además de nuestro monitoreo activo),
+    formato "número de porcentaje" (ej. -4.0). None = sin SL nativo.
 
     Devuelve dict con "ok": bool, "resultado": respuesta cruda de Pionex,
     "capital_usado": el monto final que se intentó usar.
@@ -179,10 +199,10 @@ def crear_grilla_futuros_segura(par: str, top: float, bottom: float, row: int,
     intentos = 0
     while intentos <= max_reintentos:
         intentos += 1
-        check = validar_parametros_grilla(par, top, bottom, row, capital_actual, leverage, trend, grid_type)
+        check = validar_parametros_grilla(par, top, bottom, row, capital_actual, leverage, trend, grid_type, sl_pct)
         if check.get("result") is True or check.get("code") == 0 or check.get("data"):
             # checkParams OK -> crear de verdad, INMEDIATAMENTE (sin demora que permita que el mínimo vuelva a moverse)
-            resultado = crear_grilla_futuros(par, top, bottom, row, capital_actual, leverage, trend, grid_type)
+            resultado = crear_grilla_futuros(par, top, bottom, row, capital_actual, leverage, trend, grid_type, sl_pct)
             ok = resultado.get("result") is True or resultado.get("code") == 0
             return {"ok": ok, "resultado": resultado, "capital_usado": capital_actual, "intentos": intentos}
 
@@ -199,10 +219,11 @@ def crear_grilla_futuros_segura(par: str, top: float, bottom: float, row: int,
 
 def crear_grilla_futuros(par: str, top: float, bottom: float, row: int,
                           capital_usdt: float, leverage: int = 10,
-                          trend: str = "long", grid_type: str = "arithmetic") -> dict:
+                          trend: str = "long", grid_type: str = "arithmetic",
+                          sl_pct: float = None) -> dict:
     """POST /futuresGrid/create — crea una grilla REAL. Usar vía crear_grilla_futuros_segura(), no directo."""
     path = "/api/v1/bot/orders/futuresGrid/create"
-    body_dict = _armar_body(par, top, bottom, row, capital_usdt, leverage, trend, grid_type)
+    body_dict = _armar_body(par, top, bottom, row, capital_usdt, leverage, trend, grid_type, sl_pct)
     body_json = json.dumps(body_dict, separators=(",", ":"))
     timestamp, firma = _firmar("POST", path, "", body_json)
     headers = {"PIONEX-KEY": PIONEX_API_KEY, "PIONEX-SIGNATURE": firma, "Content-Type": "application/json"}

@@ -476,6 +476,7 @@ def abrir_posicion_real(candidato: dict):
         top=candidato["rango_alto"], bottom=candidato["rango_bajo"],
         row=candidato["grillas"], capital_objetivo_usdt=capital,
         leverage=gestion_riesgo.LEVERAGE_FIJO, trend=trend,
+        sl_pct=gestion_riesgo.SL_FIJO_PCT,  # 04/09: SL nativo de respaldo, además del monitoreo activo
     )
 
     if not resultado["ok"]:
