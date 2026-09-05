@@ -155,9 +155,9 @@ def _cmd_backup_db() -> str:
 def _cmd_debug_orden(args: list) -> str:
     """
     04/09 — Diagnóstico: muestra la respuesta CRUDA de Pionex para la
-    posición abierta de un par, para confirmar los nombres reales de
-    campos (marginBalance, initUsdtInvestment, quoteInvestment, etc.)
-    antes de confiar en un cálculo automático con capital real.
+    posición de un par (abierta O ya cerrada — busca en TODO el
+    historial, no solo abiertas, para poder investigar cierres
+    inesperados después de que ya pasaron).
     Uso: /debug_orden PAR
     """
     if not args:
@@ -166,15 +166,26 @@ def _cmd_debug_orden(args: list) -> str:
     if not par.endswith("USDT"):
         par += "USDT"
 
-    abiertas = db.posiciones_abiertas()
-    senal = next((s for s in abiertas if s["par"] == par), None)
+    import sqlite3
+    conn = sqlite3.connect(db.DB_PATH)
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM senales WHERE par = ? AND bu_order_id IS NOT NULL ORDER BY id DESC LIMIT 1", (par,))
+    row = cur.fetchone()
+    conn.close()
+    senal = dict(row) if row else None
+
     if not senal or not senal.get("bu_order_id"):
-        return f"⚠️ No encontré una posición abierta de {par} con bu_order_id."
+        return f"⚠️ No encontré ninguna posición de {par} con bu_order_id en el historial."
 
     try:
         import pionex_api
         resultado = pionex_api.consultar_orden(senal["bu_order_id"])
-        return f"🔍 <b>Debug — {par}</b>\nbu_order_id: {senal['bu_order_id']}\n\n<code>{resultado}</code>"
+        estado_local = "cerrada en nuestra base" if senal["cerrado"] else "abierta en nuestra base"
+        return (
+            f"🔍 <b>Debug — {par}</b> ({estado_local}, motivo_cierre local: {senal.get('motivo_cierre') or '—'})\n"
+            f"bu_order_id: {senal['bu_order_id']}\n\n<code>{resultado}</code>"
+        )
     except Exception as e:
         return f"⚠️ Error: {e}"
 
