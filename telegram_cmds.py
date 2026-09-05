@@ -52,7 +52,15 @@ def _api(method: str, **params):
 
 
 def enviar(msg: str):
-    _api("sendMessage", chat_id=CHAT_ID, text=msg, parse_mode="HTML")
+    resultado = _api("sendMessage", chat_id=CHAT_ID, text=msg, parse_mode="HTML")
+    if not resultado.get("ok"):
+        # 05/09 FIX: antes esto fallaba en silencio total — si Telegram
+        # rechaza el envío (ej. 429 Too Many Requests por flood-limit,
+        # bloqueo temporal del chat), no había forma de saberlo. Esto
+        # puede haber pasado real el 05/09 tras el loop de mensajes
+        # duplicados de BOT_ORDER_ALREADY_CLOSED antes del fix.
+        print(f"⚠️ enviar(): Telegram RECHAZÓ el mensaje — {str(resultado)[:300]}")
+    return resultado
 
 
 def _parse_float(s):
@@ -289,6 +297,15 @@ def revisar_updates():
     global _ultimo_update_id
     data = _api("getUpdates", offset=_ultimo_update_id + 1, timeout=5)
     if not data.get("ok"):
+        # 05/09 FIX CRÍTICO: antes esto cortaba en SILENCIO TOTAL, sin
+        # loguear nada — si Telegram rechazaba getUpdates (ej. "Conflict:
+        # terminated by other getUpdates request", 2 instancias
+        # escuchando a la vez — mismo bug ya visto una vez en v18 el
+        # 16/08), el bot dejaba de escuchar comandos PARA SIEMPRE sin
+        # ningún rastro visible. Caso real: 05/09, /pausar_todo nunca
+        # llegó a procesarse desde las 10:57, sin ningún error visible
+        # hasta agregar esto.
+        print(f"⚠️ revisar_updates: Telegram getUpdates falló — {str(data)[:300]}", flush=True)
         return
     for update in data.get("result", []):
         _ultimo_update_id = max(_ultimo_update_id, update["update_id"])

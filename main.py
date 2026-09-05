@@ -545,9 +545,13 @@ def chequeo_rapido_riesgo():
     del ciclo de selección — mismo patrón que v18 (el escaneo de pares NO
     puede bloquear esto). Consulta Pionex directo, sin cascada.
     """
+    ciclo_n = 0
     while True:
+        ciclo_n += 1
         try:
             abiertas = db.posiciones_abiertas()
+            if ciclo_n % 30 == 1:  # print de "sigo vivo" cada ~1 min (30 ciclos de 2seg), no cada 2seg (no saturar logs)
+                print(f"🔄 chequeo_rapido_riesgo activo (ciclo {ciclo_n}) — {len(abiertas)} posición(es) abierta(s)", flush=True)
             for senal in abiertas:
                 precio_actual = get_precio(senal["par"])
                 if precio_actual is None:
@@ -583,31 +587,46 @@ def chequeo_rapido_riesgo():
                         # salvo, solo desactualizada en nuestra base).
                         codigo_error = cierre["resultado"].get("code") if isinstance(cierre["resultado"], dict) else None
                         if codigo_error == "BOT_ORDER_ALREADY_CLOSED":
-                            estado_real = pionex_api.esta_cerrada(senal["bu_order_id"])
-                            resultado_final = estado_real.get("resultado_pct")
-                            if resultado_final is None:
-                                resultado_final = resultado_pct  # fallback: última lectura que ya teníamos
+                            print(f"ℹ️ {senal['par']}: ya cerrada en Pionex, consultando resultado final...", flush=True)
+                            resultado_final = resultado_pct  # fallback por si consultar_orden falla o tarda
+                            try:
+                                estado_real = pionex_api.esta_cerrada(senal["bu_order_id"])
+                                if estado_real.get("resultado_pct") is not None:
+                                    resultado_final = estado_real["resultado_pct"]
+                            except Exception as e:
+                                print(f"⚠️ No se pudo consultar el resultado final de {senal['par']} (uso la última lectura): {e}", flush=True)
                             db.cerrar_senal(senal["id"], resultado_final, f"{decision['motivo']}_ya_cerrada_en_pionex")
-                            telegram_cmds.enviar(
-                                f"ℹ️ <b>{senal['par']}</b>: ya estaba cerrada en Pionex (probablemente por el SL nativo) "
-                                f"— actualizado en nuestra base. Resultado: {resultado_final:+.2f}%"
-                            )
+                            print(f"✅ {senal['par']} marcada como cerrada en nuestra base (resultado {resultado_final:+.2f}%).", flush=True)
+                            try:
+                                telegram_cmds.enviar(
+                                    f"ℹ️ <b>{senal['par']}</b>: ya estaba cerrada en Pionex (probablemente por el SL nativo) "
+                                    f"— actualizado en nuestra base. Resultado: {resultado_final:+.2f}%"
+                                )
+                            except Exception as e:
+                                print(f"⚠️ No se pudo avisar por Telegram (pero SÍ quedó cerrada en nuestra base): {e}", flush=True)
                             continue
 
-                        telegram_cmds.enviar(
-                            f"🚨 <b>{senal['par']}: Pionex RECHAZÓ el cierre</b> (motivo: {decision['motivo']})\n"
-                            f"Resultado calculado: {resultado_pct:+.2f}% | Reintentando cada 2seg — "
-                            f"si esto persiste, CERRAR MANUALMENTE en la app.\n"
-                            f"<code>{str(cierre['resultado'])[:250]}</code>"
-                        )
+                        try:
+                            telegram_cmds.enviar(
+                                f"🚨 <b>{senal['par']}: Pionex RECHAZÓ el cierre</b> (motivo: {decision['motivo']})\n"
+                                f"Resultado calculado: {resultado_pct:+.2f}% | Reintentando cada 2seg — "
+                                f"si esto persiste, CERRAR MANUALMENTE en la app.\n"
+                                f"<code>{str(cierre['resultado'])[:250]}</code>"
+                            )
+                        except Exception as e:
+                            print(f"⚠️ No se pudo avisar del rechazo de {senal['par']} por Telegram: {e}", flush=True)
                         continue
                     db.cerrar_senal(senal["id"], resultado_pct, decision["motivo"])
-                    telegram_cmds.enviar(
-                        f"{'🟢' if resultado_pct > 0 else '🔴'} <b>{senal['par']} cerrado</b> ({decision['motivo']})\n"
-                        f"Resultado: {resultado_pct:+.2f}%"
-                    )
+                    print(f"✅ {senal['par']} cerrado normal ({decision['motivo']}): {resultado_pct:+.2f}%", flush=True)
+                    try:
+                        telegram_cmds.enviar(
+                            f"{'🟢' if resultado_pct > 0 else '🔴'} <b>{senal['par']} cerrado</b> ({decision['motivo']})\n"
+                            f"Resultado: {resultado_pct:+.2f}%"
+                        )
+                    except Exception as e:
+                        print(f"⚠️ No se pudo avisar del cierre de {senal['par']} por Telegram (pero sí quedó cerrada en nuestra base): {e}", flush=True)
         except Exception as e:
-            print(f"⚠️ chequeo_rapido_riesgo: {e}")
+            print(f"⚠️ chequeo_rapido_riesgo: {e}", flush=True)
         time.sleep(2)
 
 
@@ -649,9 +668,22 @@ def main():
     schedule.every().day.at("00:01").do(recalculo_diario_job)
     schedule.every(1).minutes.do(lambda: gestion_riesgo.intentar_recalculo_diario() if db.contar_posiciones_abiertas() == 0 and not db.obtener_capital_diario() else None)
 
+    ciclo_principal = 0
     while True:
-        schedule.run_pending()
-        telegram_cmds.revisar_updates()
+        ciclo_principal += 1
+        try:
+            schedule.run_pending()
+            telegram_cmds.revisar_updates()
+        except Exception as e:
+            # 05/09 FIX CRÍTICO: este loop principal (el que escucha tus
+            # comandos de Telegram y dispara los ciclos programados) NO
+            # tenía ningún manejo de errores — un fallo acá se colgaba en
+            # silencio total, para siempre, sin ningún aviso ni reinicio.
+            # Caso real: el 05/09 el bot dejó de responder /pausar_todo
+            # desde las 10:57 sin ningún rastro visible del motivo.
+            print(f"⚠️ loop principal: {e}", flush=True)
+        if ciclo_principal % 12 == 1:  # print de "sigo vivo" cada ~1 min (12 ciclos de 5seg)
+            print(f"💓 loop principal activo (ciclo {ciclo_principal})", flush=True)
         time.sleep(5)
 
 
