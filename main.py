@@ -569,6 +569,31 @@ def chequeo_rapido_riesgo():
                         # posiciones_abiertas() y se reintenta cerrar en el
                         # próximo ciclo (2seg). Antes esto quedaba invisible
                         # y la posición real seguía corriendo sin control.
+                        #
+                        # 05/09 FIX (nuevo, encontrado en producción): esa
+                        # regla de "nunca marcar cerrado" era demasiado
+                        # amplia — si el motivo del rechazo es
+                        # BOT_ORDER_ALREADY_CLOSED, la posición YA está
+                        # cerrada de verdad en Pionex (por el SL nativo u
+                        # otro medio), no es un fallo real. Sin este caso
+                        # aparte, el bot reintentaba cerrar la misma
+                        # posición cada 2seg PARA SIEMPRE, generando spam
+                        # infinito de avisos sin ningún riesgo real de
+                        # capital de por medio (la posición ya estaba a
+                        # salvo, solo desactualizada en nuestra base).
+                        codigo_error = cierre["resultado"].get("code") if isinstance(cierre["resultado"], dict) else None
+                        if codigo_error == "BOT_ORDER_ALREADY_CLOSED":
+                            estado_real = pionex_api.esta_cerrada(senal["bu_order_id"])
+                            resultado_final = estado_real.get("resultado_pct")
+                            if resultado_final is None:
+                                resultado_final = resultado_pct  # fallback: última lectura que ya teníamos
+                            db.cerrar_senal(senal["id"], resultado_final, f"{decision['motivo']}_ya_cerrada_en_pionex")
+                            telegram_cmds.enviar(
+                                f"ℹ️ <b>{senal['par']}</b>: ya estaba cerrada en Pionex (probablemente por el SL nativo) "
+                                f"— actualizado en nuestra base. Resultado: {resultado_final:+.2f}%"
+                            )
+                            continue
+
                         telegram_cmds.enviar(
                             f"🚨 <b>{senal['par']}: Pionex RECHAZÓ el cierre</b> (motivo: {decision['motivo']})\n"
                             f"Resultado calculado: {resultado_pct:+.2f}% | Reintentando cada 2seg — "
