@@ -505,29 +505,37 @@ def abrir_posicion_real(candidato: dict):
 
 # ── Ciclo de selección (cada 15 min) ────────────────────────
 def ciclo_seleccion():
-    if db.esta_pausado_global():
-        return
+    """
+    05/09 FIX (mismo bug encontrado en PAXG): antes, estar en pausa
+    cortaba TODO el ciclo antes de analizar — no se registraba nada en
+    gates_log mientras el bot estaba pausado, así que pausar para
+    observar sin arriesgar capital no servía para juntar evidencia.
+    Ahora el análisis y el registro de CADA par SIEMPRE corren; la
+    pausa (y el tope de posiciones) solo bloquean el paso final de
+    abrir una posición real.
+    """
     if not en_horario_operativo():
         return
 
-    lugar = gestion_riesgo.hay_lugar_para_abrir()
-    if not lugar["hay_lugar"]:
-        return
+    pausado = db.esta_pausado_global()
 
     btc = analizar_btc()
     for par in PARES:
         if db.par_tiene_posicion_abierta(par):
             continue
-        lugar = gestion_riesgo.hay_lugar_para_abrir()
-        if not lugar["hay_lugar"]:
-            break
         try:
             candidato = analizar_par(par, btc)
         except Exception as e:
             print(f"Error analizando {par}: {e}")
             continue
-        if candidato:
-            abrir_posicion_real(candidato)
+        if not candidato:
+            continue
+        if pausado:
+            continue  # ya quedó registrado en gates_log, no abre nada real
+        lugar = gestion_riesgo.hay_lugar_para_abrir()
+        if not lugar["hay_lugar"]:
+            break
+        abrir_posicion_real(candidato)
 
 
 # ── Chequeo rápido de SL/trailing — DIRECTO a Pionex, cada 2seg ────
