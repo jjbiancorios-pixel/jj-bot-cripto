@@ -179,6 +179,34 @@ def _cmd_debug_orden(args: list) -> str:
         return f"⚠️ Error: {e}"
 
 
+def _cmd_cerrar_manual(args: list) -> str:
+    """
+    04/09 — Corrige manualmente una posición que en realidad YA está
+    cerrada en Pionex (cerrada a mano por Juanjo, o por cualquier motivo
+    fuera del flujo automático) pero nuestra base todavía la muestra
+    como abierta — para que deje de aparecer en /pendientes y deje de
+    disparar la alerta de huérfana cada 30 min.
+    Uso: /cerrar_manual PAR RESULTADO_PCT
+    Ej: /cerrar_manual TAO -0.66
+    """
+    if len(args) < 2:
+        return "Uso: /cerrar_manual PAR RESULTADO_PCT\nEj: /cerrar_manual TAO -0.66"
+    par = args[0].upper().strip()
+    if not par.endswith("USDT"):
+        par += "USDT"
+    resultado = _parse_float(args[1])
+    if resultado is None:
+        return "⚠️ Resultado inválido. Usá un número, ej: -0.66 o +2.43"
+
+    abiertas = db.posiciones_abiertas()
+    senal = next((s for s in abiertas if s["par"] == par), None)
+    if not senal:
+        return f"⚠️ No encontré {par} entre las posiciones abiertas en nuestra base."
+
+    db.cerrar_senal(senal["id"], resultado, "cerrado_manual")
+    return f"✅ {par} (id {senal['id']}) marcado como cerrado en nuestra base — resultado {resultado:+.2f}%. Ya no debería aparecer en /pendientes ni como huérfana."
+
+
 def _cmd_gates(args: list) -> str:
     if not args:
         return "Uso: /gates PAR\nEj: /gates BTC"
@@ -226,6 +254,8 @@ def procesar_comando(texto: str) -> str:
         return _cmd_gates(args)
     elif cmd == "/debug_orden":
         return _cmd_debug_orden(args)
+    elif cmd == "/cerrar_manual":
+        return _cmd_cerrar_manual(args)
     elif cmd in ("/ayuda", "/help", "/start"):
         return (
             "🤖 <b>Bot Cripto v2 — Comandos</b>\n\n"
@@ -234,6 +264,8 @@ def procesar_comando(texto: str) -> str:
             "/capital — capital del día (interés compuesto)\n"
             "/gates PAR — últimos 10 chequeos de gates para un par (diagnóstico)\n"
             "/debug_orden PAR — respuesta cruda de Pionex para una posición (diagnóstico)\n"
+            "/cerrar_manual PAR RESULTADO_PCT — corrige una posición ya cerrada por vos "
+            "que nuestra base sigue mostrando abierta (ej: /cerrar_manual TAO -0.66)\n"
             "/pausar_todo [motivo] — frena aperturas nuevas (SL/trailing sigue activo)\n"
             "/reanudar_todo\n"
             "/probar_pionex PAR PRECIO — prueba conexión sin crear orden real\n"
