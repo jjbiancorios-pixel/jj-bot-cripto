@@ -7,7 +7,7 @@ Diseño confirmado (JJ_Cripto_Bot_Rediseno_BotCripto.docx):
   - SL: fijo -4%
   - Trailing TP (no confundir con SL): el tramo se fija por el PICO
     MÁXIMO histórico, nunca se relaja aunque el precio retroceda
-      0% a 1%   -> breakeven (SL en 0%, sin trailing todavía)
+      0% a 1%   -> SIN protección adicional (solo el SL fijo de -4%)
       1% a 3%   -> retrocede 50% desde el pico
       3% a 8%   -> retrocede 30% desde el pico
       > 8%      -> retrocede 20% desde el pico
@@ -17,6 +17,17 @@ Diseño confirmado (JJ_Cripto_Bot_Rediseno_BotCripto.docx):
   - 6 posiciones simultáneas, máx 2 aperturas por ciclo de 15 min
   - SL/trailing: consulta DIRECTA a Pionex cada 2 seg (ver main.py,
     corre en threading.Thread aparte, patrón ya probado en v18)
+
+  05/09 FIX: el breakeven activaba con CUALQUIER pico >0%, incluso un
+  parpadeo de ruido normal de la oscilación del grid (0,1-0,2% es
+  completamente normal, no es señal de nada) — esto causó cierres
+  prematuros reales (GALAUSDT y TWTUSDT cerraron por "breakeven" casi
+  al abrir, sin haber tenido de verdad una ganancia real). Corregido:
+  ahora el pico necesita llegar a 1% (mismo umbral que PAXG) antes de
+  que exista CUALQUIER protección más allá del SL fijo — por debajo de
+  eso, solo el SL de -4% corre. Al llegar a 1%, cae directo en el
+  primer tramo de trailing (retrocede 50% desde el pico), ya no existe
+  una "zona de breakeven" separada en 0-1%.
 """
 import db
 import pionex_api
@@ -26,10 +37,11 @@ MAX_POSICIONES_SIMULTANEAS = 6
 MAX_APERTURAS_POR_CICLO = 2
 PCT_CAPITAL_POR_OPERACION = 0.05  # 5% del capital del día
 LEVERAGE_FIJO = 10
+BREAKEVEN_ACTIVACION_MINIMA_PCT = 1.0  # 05/09: antes activaba con >0%, cambiado a pedido de Juanjo
 
 # Tramos de trailing TP: (pico_desde, pico_hasta_o_None, retroceso_pct)
 TRAMOS_TRAILING = [
-    (0.0, 1.0, None),   # breakeven, sin trailing todavía
+    (0.0, 1.0, None),   # sin protección más allá del SL fijo (ver BREAKEVEN_ACTIVACION_MINIMA_PCT)
     (1.0, 3.0, 0.50),
     (3.0, 8.0, 0.30),
     (8.0, None, 0.20),
@@ -62,11 +74,10 @@ def evaluar_cierre(senal: dict, resultado_actual_pct: float) -> dict:
     pico_actual = max(senal.get("pico_maximo_pct", 0) or 0, resultado_actual_pct)
     nombre_tramo, retroceso_pct = calcular_tramo(pico_actual)
 
-    # Breakeven activa apenas el pico supera 0% (no espera a 1% — ese es
-    # el umbral donde EMPIEZA el trailing propiamente dicho, son 2 cosas
-    # distintas). Diferencia a propósito con el diseño de PAXG, que sí
-    # tiene margen de 1% antes de activar el breakeven.
-    breakeven_activo = pico_actual > 0
+    # 05/09: breakeven/trailing solo se activa si el pico llegó al menos
+    # a BREAKEVEN_ACTIVACION_MINIMA_PCT (1%) — evita cerrar por ruido
+    # normal del grid en picos chiquitos (ej. 0.1-0.2%).
+    breakeven_activo = pico_actual >= BREAKEVEN_ACTIVACION_MINIMA_PCT
 
     db.actualizar_pico_y_tramo(senal["id"], pico_actual, nombre_tramo, breakeven_activo)
 
