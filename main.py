@@ -66,7 +66,7 @@ PARES = [
 PARES_MAJORS = {"BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT"}
 
 SCORE_MAX = 10
-SCORE_UMBRAL = 7
+SCORE_UMBRAL = 8  # 06/09: subido de 7 a 8 — solo operar señales de mejor calidad
 SCORE_MOMENTUM_TOPE = 4  # familia RSI+StochRSI+MACD+Bollinger+vela, topeada
 VOLUMEN_RATIO_MINIMO = 1.5
 FUNDING_UMBRAL_PCT = 0.05  # ±0.05%/8h — a calibrar con datos reales

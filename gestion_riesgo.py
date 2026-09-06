@@ -21,20 +21,22 @@ SL fijo, trailing TP por pico, capital diario por interés compuesto.
 import db
 import pionex_api
 
-SL_FIJO_PCT = -4.0
+SL_FIJO_PCT = -7.5  # 06/09: ancho de -4% a -7.5% — dejar que la grilla se desarrolle más
 MAX_POSICIONES_SIMULTANEAS = 6
 MAX_APERTURAS_POR_CICLO = 2
 PCT_CAPITAL_POR_OPERACION = 0.05  # 5% del capital del día
 LEVERAGE_FIJO = 10
 
-# Multiplicadores sobre el ATR% de cada posición (con piso mínimo, para
-# no dejar sin protección a monedas de volatilidad casi nula)
-BREAKEVEN_ATR_MULT = 1.5
-BREAKEVEN_PISO_PCT = 1.0
-TRAMO2_ATR_MULT = 4.5   # ~3x el umbral de breakeven
-TRAMO2_PISO_PCT = 3.0
-TRAMO3_ATR_MULT = 9.0   # ~6x el umbral de breakeven
-TRAMO3_PISO_PCT = 8.0
+# 06/09: escalados junto con el nuevo SL más ancho (-7.5%, antes -4%) —
+# mismo criterio proporcional, para que el trailing no quede corto
+# frente a un SL mucho más ancho (eso ya vimos que empeora la relación
+# riesgo/beneficio: ganadoras chicas de ~0.7% vs. pérdidas de ~-4.3%).
+BREAKEVEN_ATR_MULT = 2.5
+BREAKEVEN_PISO_PCT = 2.0
+TRAMO2_ATR_MULT = 4.5   # sin cambios
+TRAMO2_PISO_PCT = 5.5
+TRAMO3_ATR_MULT = 9.0   # sin cambios
+TRAMO3_PISO_PCT = 15.0
 
 
 def _umbrales_por_atr(atr_pct: float):
@@ -51,7 +53,7 @@ def calcular_tramo(pico_pct: float, atr_pct: float = None):
     u1, u2, u3 = _umbrales_por_atr(atr_pct)
     tramos = [
         (0.0, u1, None),
-        (u1, u2, 0.50),
+        (u1, u2, 0.35),  # 06/09: bajado de 0.50 a 0.35 — deja correr más antes de asegurar
         (u2, u3, 0.30),
         (u3, None, 0.20),
     ]
