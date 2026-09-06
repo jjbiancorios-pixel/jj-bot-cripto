@@ -3,31 +3,20 @@ gestion_riesgo.py — Bot Cripto (rediseño desde cero)
 ──────────────────────────────────────────────────────
 SL fijo, trailing TP por pico, capital diario por interés compuesto.
 
-Diseño confirmado (JJ_Cripto_Bot_Rediseno_BotCripto.docx):
-  - SL: fijo -4%
-  - Trailing TP (no confundir con SL): el tramo se fija por el PICO
-    MÁXIMO histórico, nunca se relaja aunque el precio retroceda
-      0% a 1%   -> SIN protección adicional (solo el SL fijo de -4%)
-      1% a 3%   -> retrocede 50% desde el pico
-      3% a 8%   -> retrocede 30% desde el pico
-      > 8%      -> retrocede 20% desde el pico
-  - Capital: recalculo diario 00:01 ARG (pospone si hay posiciones
-    abiertas, reintenta cada 1 min), 5% del capital del día por
-    posición, SIN reserva de ningún tipo
-  - 6 posiciones simultáneas, máx 2 aperturas por ciclo de 15 min
-  - SL/trailing: consulta DIRECTA a Pionex cada 2 seg (ver main.py,
-    corre en threading.Thread aparte, patrón ya probado en v18)
-
-  05/09 FIX: el breakeven activaba con CUALQUIER pico >0%, incluso un
-  parpadeo de ruido normal de la oscilación del grid (0,1-0,2% es
-  completamente normal, no es señal de nada) — esto causó cierres
-  prematuros reales (GALAUSDT y TWTUSDT cerraron por "breakeven" casi
-  al abrir, sin haber tenido de verdad una ganancia real). Corregido:
-  ahora el pico necesita llegar a 1% (mismo umbral que PAXG) antes de
-  que exista CUALQUIER protección más allá del SL fijo — por debajo de
-  eso, solo el SL de -4% corre. Al llegar a 1%, cae directo en el
-  primer tramo de trailing (retrocede 50% desde el pico), ya no existe
-  una "zona de breakeven" separada en 0-1%.
+  05/09 FIX (investigación con evidencia real, pedido de Juanjo tras ver
+  12 operaciones —la mayoría cerrando en breakeven con ganancias <0.3%—
+  durante el período sin monitoreo): un umbral de breakeven FIJO (+1%
+  para todas las monedas por igual) causa "whipsaw" — cierra por ruido
+  normal antes de que la operación tenga margen real de desarrollarse.
+  Evidencia (búsqueda 05/09): backtest de +10.000 operaciones cripto
+  mostró que un trailing ajustado (3%) bajó el win rate de 67.9% a
+  58.2% frente a un SL fijo más ancho, por whipsaw. Recomendación
+  consistente en múltiples fuentes: umbrales basados en ATR (volatilidad
+  real de cada moneda), no un % fijo igual para todas.
+  Ahora el breakeven y los tramos de trailing escalan con el ATR% que
+  cada posición ya tiene guardado (senal["atr_pct"]) — monedas más
+  volátiles reciben más margen antes de que el breakeven las corte,
+  monedas tranquilas mantienen protección más ajustada.
 """
 import db
 import pionex_api
@@ -37,65 +26,74 @@ MAX_POSICIONES_SIMULTANEAS = 6
 MAX_APERTURAS_POR_CICLO = 2
 PCT_CAPITAL_POR_OPERACION = 0.05  # 5% del capital del día
 LEVERAGE_FIJO = 10
-BREAKEVEN_ACTIVACION_MINIMA_PCT = 1.0  # 05/09: antes activaba con >0%, cambiado a pedido de Juanjo
 
-# Tramos de trailing TP: (pico_desde, pico_hasta_o_None, retroceso_pct)
-TRAMOS_TRAILING = [
-    (0.0, 1.0, None),   # sin protección más allá del SL fijo (ver BREAKEVEN_ACTIVACION_MINIMA_PCT)
-    (1.0, 3.0, 0.50),
-    (3.0, 8.0, 0.30),
-    (8.0, None, 0.20),
-]
+# Multiplicadores sobre el ATR% de cada posición (con piso mínimo, para
+# no dejar sin protección a monedas de volatilidad casi nula)
+BREAKEVEN_ATR_MULT = 1.5
+BREAKEVEN_PISO_PCT = 1.0
+TRAMO2_ATR_MULT = 4.5   # ~3x el umbral de breakeven
+TRAMO2_PISO_PCT = 3.0
+TRAMO3_ATR_MULT = 9.0   # ~6x el umbral de breakeven
+TRAMO3_PISO_PCT = 8.0
 
 
-def calcular_tramo(pico_pct: float):
-    """Devuelve (nombre_tramo, retroceso_pct_o_None) según el pico máximo histórico."""
-    for desde, hasta, retroceso in TRAMOS_TRAILING:
+def _umbrales_por_atr(atr_pct: float):
+    """Calcula los 3 quiebres de tramo (breakeven, tramo2, tramo3) escalados por ATR, con piso mínimo."""
+    atr_pct = atr_pct or 0
+    u1 = max(BREAKEVEN_PISO_PCT, atr_pct * BREAKEVEN_ATR_MULT)
+    u2 = max(TRAMO2_PISO_PCT, atr_pct * TRAMO2_ATR_MULT)
+    u3 = max(TRAMO3_PISO_PCT, atr_pct * TRAMO3_ATR_MULT)
+    return u1, u2, u3
+
+
+def calcular_tramo(pico_pct: float, atr_pct: float = None):
+    """Devuelve (nombre_tramo, retroceso_pct_o_None) según el pico máximo histórico, escalado por ATR."""
+    u1, u2, u3 = _umbrales_por_atr(atr_pct)
+    tramos = [
+        (0.0, u1, None),
+        (u1, u2, 0.50),
+        (u2, u3, 0.30),
+        (u3, None, 0.20),
+    ]
+    for desde, hasta, retroceso in tramos:
         if hasta is None or pico_pct < hasta:
             if pico_pct >= desde:
-                nombre = f"{desde}-{hasta or 'inf'}%"
+                nombre = f"{round(desde,2)}-{round(hasta,2) if hasta else 'inf'}%"
                 return nombre, retroceso
-    return "0-1%", None
+    return f"0-{round(u1,2)}%", None
 
 
 def evaluar_cierre(senal: dict, resultado_actual_pct: float) -> dict:
     """
     Decide si una posición abierta debe cerrarse AHORA, según SL fijo
-    o trailing TP por pico. Se llama con el resultado ya consultado
-    directo a Pionex (ver main.py — chequeo_rapido_riesgo).
+    o trailing TP por pico (umbrales escalados por el ATR de la moneda).
+    Se llama con el resultado ya consultado directo a Pionex.
 
     Devuelve {"cerrar": bool, "motivo": str|None}.
     """
-    # 1. SL fijo — siempre se chequea primero, sin excepción
     if resultado_actual_pct <= SL_FIJO_PCT:
         return {"cerrar": True, "motivo": "stop_loss"}
 
-    # 2. Actualizar pico máximo histórico (nunca baja)
+    atr_pct = senal.get("atr_pct")
     pico_actual = max(senal.get("pico_maximo_pct", 0) or 0, resultado_actual_pct)
-    nombre_tramo, retroceso_pct = calcular_tramo(pico_actual)
+    nombre_tramo, retroceso_pct = calcular_tramo(pico_actual, atr_pct)
 
-    # 05/09: breakeven/trailing solo se activa si el pico llegó al menos
-    # a BREAKEVEN_ACTIVACION_MINIMA_PCT (1%) — evita cerrar por ruido
-    # normal del grid en picos chiquitos (ej. 0.1-0.2%).
-    breakeven_activo = pico_actual >= BREAKEVEN_ACTIVACION_MINIMA_PCT
+    umbral_breakeven, _, _ = _umbrales_por_atr(atr_pct)
+    breakeven_activo = pico_actual >= umbral_breakeven
 
     db.actualizar_pico_y_tramo(senal["id"], pico_actual, nombre_tramo, breakeven_activo)
 
-    # 3. Breakeven (pico entre 0 y 1%, sin trailing todavía): cierra si vuelve a <=0
     if not breakeven_activo:
         return {"cerrar": False, "motivo": None}
 
     if retroceso_pct is None:
-        # Pico está justo en el límite exacto del breakeven (raro, borde) — tratar como breakeven
         if resultado_actual_pct <= 0:
             return {"cerrar": True, "motivo": "breakeven"}
         return {"cerrar": False, "motivo": None}
 
-    # 4. Trailing activo: cierra si retrocedió más del % permitido desde el pico
     piso_permitido = pico_actual * (1 - retroceso_pct)
     if resultado_actual_pct <= piso_permitido:
         return {"cerrar": True, "motivo": "trailing_tp"}
-    # Aun en tramo de trailing, nunca puede caer por debajo de 0% (breakeven es el piso absoluto)
     if resultado_actual_pct <= 0:
         return {"cerrar": True, "motivo": "breakeven"}
 
