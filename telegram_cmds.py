@@ -226,6 +226,47 @@ def _cmd_cerrar_manual(args: list) -> str:
     return f"✅ {par} (id {senal['id']}) marcado como cerrado en nuestra base — resultado {resultado:+.2f}%. Ya no debería aparecer en /pendientes ni como huérfana."
 
 
+def _cmd_informe(args: list) -> str:
+    """
+    07/09 — Informe completo para análisis (ganadoras/perdedoras,
+    promedios, neto, desglose por motivo, score ganadoras vs perdedoras,
+    selectividad). Uso: /informe [FECHA|todo] — sin argumento, hoy.
+    Ej: /informe 20260906  |  /informe todo
+    """
+    desde_fecha = None
+    if args:
+        if args[0].lower() != "todo":
+            desde_fecha = args[0]
+    else:
+        desde_fecha = datetime.now(db.TZ_ARG).strftime("%Y%m%d")
+
+    r = db.resumen_completo(desde_fecha)
+    etiqueta = "TODO EL HISTORIAL" if desde_fecha is None else desde_fecha
+
+    if r["n_cerradas"] == 0:
+        return f"📊 <b>Informe — {etiqueta}</b>\nSin operaciones cerradas en este período.\nCandidatos evaluados: {r['total_evaluados']} | Calificaron: {r['total_califico']}"
+
+    lineas = [
+        f"📊 <b>Informe completo — {etiqueta}</b>",
+        f"Cerradas: {r['n_cerradas']} | ✅ {r['n_ganadoras']} | ❌ {r['n_perdedoras']} | Win rate: {r['win_rate_pct']}%",
+        f"Ganancia prom: {r['ganancia_prom_pct']:+.2f}% | Pérdida prom: {r['perdida_prom_pct']:+.2f}%",
+        f"<b>Resultado neto: {r['resultado_neto_pct']:+.2f}%</b>",
+        f"Mejor: {r['mejor_pct']:+.2f}% | Peor: {r['peor_pct']:+.2f}%",
+        "",
+        "<b>Por motivo de cierre:</b>",
+    ]
+    for motivo, d in r["por_motivo"].items():
+        lineas.append(f"  {motivo}: n={d['n']} | prom {d['prom']:+.2f}%")
+
+    if r.get("score_prom_ganadoras") is not None or r.get("score_prom_perdedoras") is not None:
+        lineas.append("")
+        lineas.append(f"Score prom. ganadoras: {r.get('score_prom_ganadoras')} | perdedoras: {r.get('score_prom_perdedoras')}")
+
+    lineas.append("")
+    lineas.append(f"Candidatos evaluados: {r['total_evaluados']} | Calificaron: {r['total_califico']}")
+    return "\n".join(lineas)
+
+
 def _cmd_gates(args: list) -> str:
     if not args:
         return "Uso: /gates PAR\nEj: /gates BTC"
@@ -271,6 +312,8 @@ def procesar_comando(texto: str) -> str:
         return _cmd_backup_db()
     elif cmd == "/gates":
         return _cmd_gates(args)
+    elif cmd == "/informe":
+        return _cmd_informe(args)
     elif cmd == "/debug_orden":
         return _cmd_debug_orden(args)
     elif cmd == "/cerrar_manual":
@@ -282,6 +325,8 @@ def procesar_comando(texto: str) -> str:
             "/pendientes — posiciones abiertas ahora, con pico y tramo de trailing\n"
             "/capital — capital del día (interés compuesto)\n"
             "/gates PAR — últimos 10 chequeos de gates para un par (diagnóstico)\n"
+            "/informe [FECHA|todo] — informe completo para análisis: ganadoras/perdedoras, "
+            "promedios, neto, por motivo, score, selectividad. Ej: /informe todo\n"
             "/debug_orden PAR — respuesta cruda de Pionex para una posición (diagnóstico)\n"
             "/cerrar_manual PAR RESULTADO_PCT — corrige una posición ya cerrada por vos "
             "que nuestra base sigue mostrando abierta (ej: /cerrar_manual TAO -0.66)\n"

@@ -336,6 +336,72 @@ def obtener_capital_diario():
 
 
 # ── Resúmenes básicos ────────────────────────────────────────
+def resumen_completo(desde_fecha: str = None) -> dict:
+    """
+    07/09 — Informe completo para análisis, en un solo comando: evita
+    tener que pegar logs enteros a mano. Incluye desglose por motivo de
+    cierre y comparación de score entre ganadoras/perdedoras (para
+    analizar calidad de entrada, no solo resultado agregado).
+    """
+    conn = _conn()
+    cur = conn.cursor()
+    query = "SELECT * FROM senales WHERE cerrado = 1 AND resultado_pct IS NOT NULL AND bu_order_id IS NOT NULL"
+    params = ()
+    if desde_fecha:
+        query += " AND fecha >= ?"
+        params = (desde_fecha,)
+    cur.execute(query, params)
+    cerradas = [dict(r) for r in cur.fetchall()]
+
+    # Candidatos evaluados en el período (gates_log) vs. los que realmente abrieron
+    query_gates = "SELECT COUNT(*) FROM gates_log"
+    query_calif = "SELECT COUNT(*) FROM gates_log WHERE califico = 1"
+    params_gates = ()
+    if desde_fecha:
+        query_gates += " WHERE fecha >= ?"
+        query_calif += " AND fecha >= ?"
+        params_gates = (desde_fecha,)
+    cur.execute(query_gates, params_gates)
+    total_evaluados = cur.fetchone()[0]
+    cur.execute(query_calif, params_gates)
+    total_califico = cur.fetchone()[0]
+    conn.close()
+
+    if not cerradas:
+        return {"n_cerradas": 0, "total_evaluados": total_evaluados, "total_califico": total_califico}
+
+    ganadoras = [r for r in cerradas if r["resultado_pct"] > 0]
+    perdedoras = [r for r in cerradas if r["resultado_pct"] <= 0]
+    resultados = [r["resultado_pct"] for r in cerradas]
+
+    def _prom(lst, campo="resultado_pct"):
+        vals = [r[campo] for r in lst if r.get(campo) is not None]
+        return round(sum(vals) / len(vals), 2) if vals else None
+
+    por_motivo = {}
+    for r in cerradas:
+        m = r.get("motivo_cierre") or "desconocido"
+        por_motivo.setdefault(m, []).append(r["resultado_pct"])
+    por_motivo_resumen = {m: {"n": len(v), "prom": round(sum(v) / len(v), 2)} for m, v in por_motivo.items()}
+
+    return {
+        "n_cerradas": len(cerradas),
+        "n_ganadoras": len(ganadoras),
+        "n_perdedoras": len(perdedoras),
+        "win_rate_pct": round(len(ganadoras) / len(cerradas) * 100, 1),
+        "ganancia_prom_pct": _prom(ganadoras),
+        "perdida_prom_pct": _prom(perdedoras),
+        "resultado_neto_pct": round(sum(resultados), 2),
+        "mejor_pct": round(max(resultados), 2),
+        "peor_pct": round(min(resultados), 2),
+        "por_motivo": por_motivo_resumen,
+        "score_prom_ganadoras": _prom(ganadoras, "score"),
+        "score_prom_perdedoras": _prom(perdedoras, "score"),
+        "total_evaluados": total_evaluados,
+        "total_califico": total_califico,
+    }
+
+
 def resumen_diario(fecha: str = None) -> dict:
     conn = _conn()
     cur = conn.cursor()
