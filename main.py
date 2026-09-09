@@ -388,34 +388,11 @@ def analizar_par(par: str, btc: dict):
 
     # ── GATE 1: ADX + DI (umbral diferenciado por tipo de par) ──
     adx_umbral = 23 if par in PARES_MAJORS else 28
+    ADX_TECHO = 47  # 08/09 (3er ajuste): se saca el filtro de sobreextensión, se prueba techo de ADX solo
     di_confirma = (plus_di > minus_di) if direccion == "LARGO" else (minus_di > plus_di)
-    paso_adx = adx > adx_umbral and di_confirma
+    paso_adx = adx > adx_umbral and adx <= ADX_TECHO and di_confirma
     if not paso_adx:
         db.guardar_gates_log(par, direccion, adx, adx_umbral, False, False, False, 0, 0, False)
-        return None
-
-    # ── GATE 1b: sobreextensión — 3 velas seguidas del mismo color ──
-    # (08/09, pedido de Juanjo): si las últimas 3 velas de 15min ya
-    # vinieron todas a favor de la dirección candidata, es un patrón
-    # clásico de posible agotamiento/reversión (ej. "3 soldados blancos"),
-    # no de continuación — mejor esperar un pullback que perseguir el
-    # movimiento cuando ya lleva 3 velas seguidas.
-    #
-    # 08/09 (2do ajuste, misma noche): se sacó el techo de ADX (37) y el
-    # chequeo de "ADX bajando" que se habían agregado en el primer
-    # intento — 0 señales en toda la noche, coincide con el mismo
-    # patrón ya visto en v18 al combinar demasiadas restricciones a la
-    # vez (multiplican en vez de sumar). Se deja SOLO este filtro de
-    # sobreextensión, que probablemente ya capturaba los 3 casos reales
-    # de ADX 39/40/49 (una tendencia con ADX tan alto suele venir
-    # acompañada de velas consecutivas a favor) sin agregar 2
-    # restricciones más encima de los filtros existentes.
-    ultimas_3 = df15.iloc[-3:]
-    alcistas = (ultimas_3["close"] > ultimas_3["open"]).sum()
-    bajistas = (ultimas_3["close"] < ultimas_3["open"]).sum()
-    sobreextendida = (direccion == "LARGO" and alcistas == 3) or (direccion == "CORTO" and bajistas == 3)
-    if sobreextendida:
-        db.guardar_gates_log(par, direccion, adx, adx_umbral, True, False, False, 0, 0, False)
         return None
 
     # ── GATE 2: alineación EMA20 4h ──
