@@ -252,7 +252,12 @@ def calc_adx(df, p=14):
     minus_di = 100 * pd.Series(minus_dm, index=df.index).ewm(alpha=1 / p, adjust=False).mean() / atr_w.replace(0, np.nan)
     dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
     adx = dx.ewm(alpha=1 / p, adjust=False).mean()
-    return {"adx": float(adx.iloc[-1]), "plus_di": float(plus_di.iloc[-1]), "minus_di": float(minus_di.iloc[-1])}
+    # 08/09: ADX de 3 velas atrás, para detectar si la tendencia ya viene
+    # perdiendo fuerza (ADX cayendo) aunque el valor actual siga alto —
+    # entrar con ADX extremo y en baja suele ser entrar tarde, cerca del
+    # agotamiento de la tendencia (3 pérdidas reales: ADX 39/40/49).
+    adx_hace_3 = float(adx.iloc[-4]) if len(adx) >= 4 else float(adx.iloc[-1])
+    return {"adx": float(adx.iloc[-1]), "plus_di": float(plus_di.iloc[-1]), "minus_di": float(minus_di.iloc[-1]), "adx_hace_3": adx_hace_3}
 
 
 def patron_vela_score(df, direccion: str) -> int:
@@ -344,6 +349,7 @@ def analizar_par(par: str, btc: dict):
     adx_info = calc_adx(df1h)
     adx = adx_info["adx"]
     plus_di, minus_di = adx_info["plus_di"], adx_info["minus_di"]
+    adx_hace_3 = adx_info["adx_hace_3"]
 
     ema20_4h = calc_ema(df4h["close"], 20)
     ema9_1h = calc_ema(df1h["close"], 9)
@@ -360,12 +366,48 @@ def analizar_par(par: str, btc: dict):
         return None
     direccion = "LARGO" if ema9_1h > ema21_1h else "CORTO"
 
+    # 07/09 — PERSISTENCIA DE TENDENCIA (calculada en UNA sola pasada,
+    # no repitiendo el análisis 2 veces): exige que la dirección
+    # (EMA9 vs EMA21 en 1h) se haya sostenido en las últimas 3 velas, no
+    # solo en la actual — descarta cruces de un solo instante que
+    # revierten enseguida, sin la trampa histórica de v18 (exigir que la
+    # combinación COMPLETA de filtros se repita en 2 evaluaciones
+    # SEPARADAS resultó en 0% de señales sobreviviendo, por multiplicar
+    # probabilidades ya bajas en vez de sumarlas). Acá se mira el
+    # historial ya disponible en df1h, sin ningún costo extra de cómputo
+    # ni de consultas.
+    N_VELAS_PERSISTENCIA = 3
+    ema9_serie = df1h["close"].ewm(span=9).mean()
+    ema21_serie = df1h["close"].ewm(span=21).mean()
+    diff_serie = (ema9_serie - ema21_serie).iloc[-N_VELAS_PERSISTENCIA:]
+    signo_actual = 1 if direccion == "LARGO" else -1
+    persistio = bool((np.sign(diff_serie) == signo_actual).all())
+    if not persistio:
+        db.guardar_gates_log(par, "SIN_PERSISTENCIA", adx, 0, False, False, False, 0, 0, False)
+        return None
+
     # ── GATE 1: ADX + DI (umbral diferenciado por tipo de par) ──
     adx_umbral = 23 if par in PARES_MAJORS else 28
+    ADX_TECHO = 37  # 08/09: bajado de 45 a 37 (no bloqueaba los 3 casos reales de ADX 39/40/49)
+    adx_bajando = adx < adx_hace_3
     di_confirma = (plus_di > minus_di) if direccion == "LARGO" else (minus_di > plus_di)
-    paso_adx = adx > adx_umbral and di_confirma
+    paso_adx = adx > adx_umbral and adx <= ADX_TECHO and not adx_bajando and di_confirma
     if not paso_adx:
         db.guardar_gates_log(par, direccion, adx, adx_umbral, False, False, False, 0, 0, False)
+        return None
+
+    # ── GATE 1b: sobreextensión — 3 velas seguidas del mismo color ──
+    # (08/09, pedido de Juanjo): si las últimas 3 velas de 15min ya
+    # vinieron todas a favor de la dirección candidata, es un patrón
+    # clásico de posible agotamiento/reversión (ej. "3 soldados blancos"),
+    # no de continuación — mejor esperar un pullback que perseguir el
+    # movimiento cuando ya lleva 3 velas seguidas.
+    ultimas_3 = df15.iloc[-3:]
+    alcistas = (ultimas_3["close"] > ultimas_3["open"]).sum()
+    bajistas = (ultimas_3["close"] < ultimas_3["open"]).sum()
+    sobreextendida = (direccion == "LARGO" and alcistas == 3) or (direccion == "CORTO" and bajistas == 3)
+    if sobreextendida:
+        db.guardar_gates_log(par, direccion, adx, adx_umbral, True, False, False, 0, 0, False)
         return None
 
     # ── GATE 2: alineación EMA20 4h ──
