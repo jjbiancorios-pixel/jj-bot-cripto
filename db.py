@@ -29,6 +29,22 @@ def _conn():
     return conn
 
 
+def _migrar_columnas_nuevas(cur):
+    """
+    07-10/09 — Agrega columnas nuevas a una tabla `senales` que ya existe
+    en producción (ALTER TABLE, no rompe los datos ya guardados).
+    """
+    columnas_nuevas = [
+        ("fuera_rango_desde", "TEXT"),
+        ("fecha_cierre", "TEXT"),
+    ]
+    for nombre, tipo in columnas_nuevas:
+        try:
+            cur.execute(f"ALTER TABLE senales ADD COLUMN {nombre} {tipo}")
+        except Exception:
+            pass  # ya existe
+
+
 def init_db():
     """Crea las tablas si no existen. Llamar una vez al iniciar el bot."""
     conn = _conn()
@@ -74,6 +90,7 @@ def init_db():
             breakeven_activo INTEGER DEFAULT 0,
             pico_maximo_pct REAL DEFAULT 0,
             tramo_trailing_actual TEXT,
+            fuera_rango_desde TEXT,
 
             -- Resultado
             cerrado INTEGER DEFAULT 0,
@@ -126,11 +143,48 @@ def init_db():
         )
     """)
 
+    _migrar_columnas_nuevas(cur)
+
     conn.commit()
     conn.close()
 
 
 # ── Pausa global ─────────────────────────────────────────────
+def actualizar_fuera_rango(senal_id: int, desde_iso: str = None):
+    """desde_iso=None -> resetea (volvió a estar dentro de rango o nunca salió)."""
+    conn = _conn()
+    cur = conn.cursor()
+    cur.execute("UPDATE senales SET fuera_rango_desde = ? WHERE id = ?", (desde_iso, senal_id))
+    conn.commit()
+    conn.close()
+
+
+def obtener_estado_btc_cauto() -> dict:
+    conn = _conn()
+    cur = conn.cursor()
+    cur.execute("SELECT valor FROM config WHERE clave = 'btc_modo_cauto'")
+    row = cur.fetchone()
+    conn.close()
+    return {"activo": bool(row and row[0] == "1")}
+
+
+def guardar_estado_btc_cauto(activo: bool):
+    conn = _conn()
+    cur = conn.cursor()
+    cur.execute("INSERT OR REPLACE INTO config (clave, valor) VALUES ('btc_modo_cauto', ?)", ("1" if activo else "0",))
+    conn.commit()
+    conn.close()
+
+
+def contar_posiciones_por_direccion(direccion: str) -> int:
+    conn = _conn()
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM senales WHERE cerrado = 0 AND bu_order_id IS NOT NULL AND direccion = ?", (direccion,))
+    n = cur.fetchone()[0]
+    conn.close()
+    return n
+
+
 def pausar_todo(motivo: str = ""):
     conn = _conn()
     cur = conn.cursor()
@@ -304,9 +358,10 @@ def cerrar_senal(senal_id: int, resultado_pct: float, motivo: str):
             pass
     cur.execute("""
         UPDATE senales SET cerrado = 1, resultado_pct = ?, motivo_cierre = ?,
-                            tiempo_real_min = ?, hora_cierre = ?
+                            tiempo_real_min = ?, hora_cierre = ?, fecha_cierre = ?
         WHERE id = ?
-    """, (resultado_pct, motivo, tiempo_real_min, datetime.now(TZ_ARG).strftime("%H:%M"), senal_id))
+    """, (resultado_pct, motivo, tiempo_real_min, datetime.now(TZ_ARG).strftime("%H:%M"),
+          datetime.now(TZ_ARG).strftime("%Y%m%d"), senal_id))
     conn.commit()
     conn.close()
 
@@ -336,21 +391,30 @@ def obtener_capital_diario():
 
 
 # ── Resúmenes básicos ────────────────────────────────────────
-def resumen_completo(desde_fecha: str = None) -> dict:
+def resumen_completo(desde_fecha: str = None, hasta_fecha: str = None, por_cierre: bool = False) -> dict:
     """
-    07/09 — Informe completo para análisis, en un solo comando: evita
-    tener que pegar logs enteros a mano. Incluye desglose por motivo de
-    cierre y comparación de score entre ganadoras/perdedoras (para
-    analizar calidad de entrada, no solo resultado agregado).
+    07/09 — Informe completo para análisis, en un solo comando. Incluye
+    desglose por motivo de cierre y score ganadoras/perdedoras.
+
+    10/09 — 2 mejoras pedidas:
+    - hasta_fecha: permite acotar un rango exacto (antes solo "desde tal
+      fecha hasta hoy"), ej. desde_fecha=hasta_fecha para un solo día.
+    - por_cierre: filtra por FECHA DE CIERRE en vez de fecha de apertura
+      (antes solo existía el filtro por apertura — una operación abierta
+      ayer y cerrada hoy no aparecía en el informe de "hoy").
     """
     conn = _conn()
     cur = conn.cursor()
+    campo_fecha = "fecha_cierre" if por_cierre else "fecha"
     query = "SELECT * FROM senales WHERE cerrado = 1 AND resultado_pct IS NOT NULL AND bu_order_id IS NOT NULL"
-    params = ()
+    params = []
     if desde_fecha:
-        query += " AND fecha >= ?"
-        params = (desde_fecha,)
-    cur.execute(query, params)
+        query += f" AND {campo_fecha} >= ?"
+        params.append(desde_fecha)
+    if hasta_fecha:
+        query += f" AND {campo_fecha} <= ?"
+        params.append(hasta_fecha)
+    cur.execute(query, tuple(params))
     cerradas = [dict(r) for r in cur.fetchall()]
 
     # Candidatos evaluados en el período (gates_log) vs. los que realmente abrieron

@@ -49,7 +49,7 @@ PARES = [
     "CHZUSDT", "CRVUSDT", "RUNEUSDT", "HBARUSDT",
     "ARBUSDT", "INJUSDT", "SUIUSDT", "WLDUSDT",
     "STXUSDT", "LDOUSDT", "SEIUSDT", "FETUSDT", "GRTUSDT",
-    "1000PEPEUSDT", "WIFUSDT", "FLOKIUSDT",
+    "WIFUSDT", "FLOKIUSDT",  # 10/09: sacado 1000PEPEUSDT — no disponible en Pionex Futures Grid
     "ENAUSDT", "TIAUSDT", "NOTUSDT", "TAOUSDT",
     "ORDIUSDT", "ACEUSDT", "ALTUSDT", "PORTALUSDT",
     "APTUSDT", "ARKMUSDT", "BLURUSDT", "GMTUSDT", "IMXUSDT",
@@ -319,19 +319,55 @@ def calcular_grillas_wrapper(rango_pct):
 
 # ── BTC — contexto general ──────────────────────────────────
 def analizar_btc():
+    """
+    10/09 — Se agregó detección de "cambio reciente" de tendencia (mismo
+    principio que la persistencia de 3 velas ya usada para cada moneda,
+    aplicado acá al contexto de BTC) — sirve para activar el modo cauto
+    de exposición direccional (ver actualizar_modo_cauto_btc).
+    """
     df = get_velas("BTCUSDT", "1h", 100)
     if df is None:
-        return {"estado": "SIN_DATO", "cambio_1h_pct": 0}
-    ema9 = calc_ema(df["close"], 9)
-    ema21 = calc_ema(df["close"], 21)
+        return {"estado": "SIN_DATO", "cambio_1h_pct": 0, "cambio_reciente": False, "persistio_3": False}
+    ema9_serie = df["close"].ewm(span=9).mean()
+    ema21_serie = df["close"].ewm(span=21).mean()
+    ema9 = float(ema9_serie.iloc[-1])
+    ema21 = float(ema21_serie.iloc[-1])
     cambio_1h_pct = (df["close"].iloc[-1] - df["close"].iloc[-2]) / df["close"].iloc[-2] * 100
-    if ema9 > ema21 * 1.001:
-        estado = "ALCISTA"
-    elif ema9 < ema21 * 0.999:
-        estado = "BAJISTA"
-    else:
+
+    diff_pct = abs(ema9 - ema21) / ema21 * 100 if ema21 > 0 else 0
+    if diff_pct < 0.05:
         estado = "LATERAL"
-    return {"estado": estado, "cambio_1h_pct": round(cambio_1h_pct, 3)}
+    elif ema9 > ema21:
+        estado = "ALCISTA"
+    else:
+        estado = "BAJISTA"
+
+    diff_serie = (ema9_serie - ema21_serie)
+    signo_ahora = 1 if ema9 > ema21 else -1
+    signo_hace_3 = 1 if diff_serie.iloc[-4] > 0 else -1 if len(diff_serie) >= 4 else signo_ahora
+    cambio_reciente = estado != "LATERAL" and signo_ahora != signo_hace_3
+    persistio_3 = bool((np.sign(diff_serie.iloc[-3:]) == signo_ahora).all())
+
+    return {"estado": estado, "cambio_1h_pct": round(cambio_1h_pct, 3),
+            "cambio_reciente": cambio_reciente, "persistio_3": persistio_3}
+
+
+def actualizar_modo_cauto_btc(btc: dict):
+    """
+    10/09 — Activa el modo cauto (límite de 3-de-6 posiciones por
+    dirección) cuando BTC muestra un cambio reciente de tendencia. Se
+    desactiva solo, automático, cuando pasa cualquiera de estas 2 cosas:
+    - la tendencia nueva se confirma (3 velas seguidas sostenidas, misma
+      técnica ya usada para cada moneda individual)
+    - BTC vuelve a lateral (sin riesgo real de lado equivocado)
+    """
+    estado_cauto = db.obtener_estado_btc_cauto()
+    if not estado_cauto["activo"]:
+        if btc.get("cambio_reciente"):
+            db.guardar_estado_btc_cauto(True)
+    else:
+        if btc["estado"] == "LATERAL" or btc.get("persistio_3"):
+            db.guardar_estado_btc_cauto(False)
 
 
 # ── Análisis de un par: 3 gates + score ─────────────────────
@@ -547,6 +583,9 @@ def ciclo_seleccion():
     pausado = db.esta_pausado_global()
 
     btc = analizar_btc()
+    actualizar_modo_cauto_btc(btc)
+    modo_cauto_activo = db.obtener_estado_btc_cauto()["activo"]
+
     for par in PARES:
         if db.par_tiene_posicion_abierta(par):
             continue
@@ -559,6 +598,11 @@ def ciclo_seleccion():
             continue
         if pausado:
             continue  # ya quedó registrado en gates_log, no abre nada real
+        # 10/09: modo cauto (BTC cambió de tendencia hace poco) — límite
+        # de 3-de-6 posiciones en la misma dirección, para no quedar
+        # todas concentradas del mismo lado justo cuando BTC gira.
+        if modo_cauto_activo and db.contar_posiciones_por_direccion(candidato["direccion"]) >= 3:
+            continue
         lugar = gestion_riesgo.hay_lugar_para_abrir()
         if not lugar["hay_lugar"]:
             break
@@ -573,9 +617,21 @@ def chequeo_rapido_riesgo():
     puede bloquear esto). Consulta Pionex directo, sin cascada.
     """
     ciclo_n = 0
+    btc_cache = {"estado": None, "ciclo_actualizado": -999}
     while True:
         ciclo_n += 1
         try:
+            # 10/09: estado de BTC cacheado, se refresca cada ~1 min (30
+            # ciclos de 2seg) — no tiene sentido consultarlo cada 2seg,
+            # BTC no cambia de tendencia en segundos, y ahorra llamadas
+            # a la cascada externa sin ninguna pérdida real de precisión.
+            if ciclo_n - btc_cache["ciclo_actualizado"] >= 30:
+                try:
+                    btc_cache["estado"] = analizar_btc()["estado"]
+                    btc_cache["ciclo_actualizado"] = ciclo_n
+                except Exception:
+                    pass  # se sigue usando el valor cacheado anterior si falla
+
             abiertas = db.posiciones_abiertas()
             if ciclo_n % 30 == 1:  # print de "sigo vivo" cada ~1 min (30 ciclos de 2seg), no cada 2seg (no saturar logs)
                 print(f"🔄 chequeo_rapido_riesgo activo (ciclo {ciclo_n}) — {len(abiertas)} posición(es) abierta(s)", flush=True)
@@ -591,7 +647,7 @@ def chequeo_rapido_riesgo():
 
                 db.actualizar_mae_mfe(senal["id"], resultado_pct)
 
-                decision = gestion_riesgo.evaluar_cierre(senal, resultado_pct)
+                decision = gestion_riesgo.evaluar_cierre(senal, resultado_pct, precio_actual, btc_cache["estado"])
                 if decision["cerrar"]:
                     cierre = pionex_api.cerrar_grilla_futuros(senal["bu_order_id"], nota=decision["motivo"])
                     if not cierre["ok"]:

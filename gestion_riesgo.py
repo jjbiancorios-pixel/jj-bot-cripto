@@ -20,6 +20,8 @@ SL fijo, trailing TP por pico, capital diario por interés compuesto.
 """
 import db
 import pionex_api
+from datetime import datetime
+from db import TZ_ARG
 
 SL_FIJO_PCT = -7.5  # 06/09: ancho de -4% a -7.5% — dejar que la grilla se desarrolle más
 MAX_POSICIONES_SIMULTANEAS = 6
@@ -65,11 +67,27 @@ def calcular_tramo(pico_pct: float, atr_pct: float = None):
     return f"0-{round(u1,2)}%", None
 
 
-def evaluar_cierre(senal: dict, resultado_actual_pct: float) -> dict:
+HORAS_MAX_FUERA_DE_RANGO = 3  # 10/09: cierre forzado si lleva más de esto fuera del rango de la grilla
+
+
+def evaluar_cierre(senal: dict, resultado_actual_pct: float, precio_actual: float = None, btc_estado: str = None) -> dict:
     """
     Decide si una posición abierta debe cerrarse AHORA, según SL fijo
     o trailing TP por pico (umbrales escalados por el ATR de la moneda).
     Se llama con el resultado ya consultado directo a Pionex.
+
+    10/09 — 2 mecanismos nuevos, ambos SOLO si ya cruzó breakeven (nunca
+    aumentan el riesgo de una posición que sigue en pérdida sin haber
+    ganado nunca — eso sigue protegido solo por el SL fijo):
+    1. Fuera de rango: si el precio actual quedó fuera del rango de la
+       grilla (Pionex "pausa el arbitraje"), el retroceso permitido se
+       reduce a la MITAD mientras dure — y si pasan 3hs seguidas fuera
+       de rango, se fuerza el cierre igual, tenga el resultado que tenga.
+    2. BTC en contra: si BTC cambió de tendencia y quedó en contra de la
+       dirección de esta posición, mismo efecto (retroceso a la mitad,
+       sin cierre forzado por tiempo — solo aplica el punto 1 a eso).
+    Las 2 condiciones NO se suman: si ambas se dan a la vez, el
+    retroceso queda igual de reducido (a la mitad), no más.
 
     Devuelve {"cerrar": bool, "motivo": str|None}.
     """
@@ -86,16 +104,50 @@ def evaluar_cierre(senal: dict, resultado_actual_pct: float) -> dict:
     db.actualizar_pico_y_tramo(senal["id"], pico_actual, nombre_tramo, breakeven_activo)
 
     if not breakeven_activo:
+        db.actualizar_fuera_rango(senal["id"], None)  # nunca cruzó breakeven, no aplica ninguno de los 2 mecanismos
         return {"cerrar": False, "motivo": None}
+
+    # ── Mecanismo 1: fuera de rango (solo acá abajo, ya con breakeven activo) ──
+    fuera_de_rango = False
+    if precio_actual is not None and senal.get("rango_bajo") and senal.get("rango_alto"):
+        fuera_de_rango = precio_actual < senal["rango_bajo"] or precio_actual > senal["rango_alto"]
+
+    fuera_rango_desde = senal.get("fuera_rango_desde")
+    if fuera_de_rango and not fuera_rango_desde:
+        fuera_rango_desde = datetime.now(TZ_ARG).isoformat()
+        db.actualizar_fuera_rango(senal["id"], fuera_rango_desde)
+    elif not fuera_de_rango and fuera_rango_desde:
+        fuera_rango_desde = None
+        db.actualizar_fuera_rango(senal["id"], None)
+
+    if fuera_rango_desde:
+        try:
+            desde_dt = datetime.fromisoformat(fuera_rango_desde)
+            horas_fuera = (datetime.now(TZ_ARG) - desde_dt).total_seconds() / 3600
+            if horas_fuera >= HORAS_MAX_FUERA_DE_RANGO:
+                return {"cerrar": True, "motivo": "fuera_rango_3hs"}
+        except Exception:
+            pass
+
+    # ── Mecanismo 2: BTC en contra ──
+    direccion = senal.get("direccion")
+    btc_en_contra = bool(btc_estado) and (
+        (direccion == "LARGO" and btc_estado == "BAJISTA") or
+        (direccion == "CORTO" and btc_estado == "ALCISTA")
+    )
+
+    modo_cauto = fuera_de_rango or btc_en_contra
 
     if retroceso_pct is None:
         if resultado_actual_pct <= 0:
             return {"cerrar": True, "motivo": "breakeven"}
         return {"cerrar": False, "motivo": None}
 
-    piso_permitido = pico_actual * (1 - retroceso_pct)
+    retroceso_efectivo = retroceso_pct / 2 if modo_cauto else retroceso_pct
+    piso_permitido = pico_actual * (1 - retroceso_efectivo)
     if resultado_actual_pct <= piso_permitido:
-        return {"cerrar": True, "motivo": "trailing_tp"}
+        motivo = "trailing_tp_cauto" if modo_cauto else "trailing_tp"
+        return {"cerrar": True, "motivo": motivo}
     if resultado_actual_pct <= 0:
         return {"cerrar": True, "motivo": "breakeven"}
 

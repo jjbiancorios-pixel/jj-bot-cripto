@@ -228,20 +228,38 @@ def _cmd_cerrar_manual(args: list) -> str:
 
 def _cmd_informe(args: list) -> str:
     """
-    07/09 — Informe completo para análisis (ganadoras/perdedoras,
-    promedios, neto, desglose por motivo, score ganadoras vs perdedoras,
-    selectividad). Uso: /informe [FECHA|todo] — sin argumento, hoy.
-    Ej: /informe 20260906  |  /informe todo
+    07/09 — Informe completo para análisis. 10/09: ahora soporta rango de
+    fechas y filtro por fecha de CIERRE (además del de apertura, que se
+    mantiene como estaba).
+    Uso: /informe [cerradas] [FECHA_DESDE [FECHA_HASTA]|todo]
+    Ej: /informe                    -> hoy, por apertura (default de siempre)
+        /informe todo               -> todo el historial
+        /informe 20260906           -> desde esa fecha hasta hoy (como antes)
+        /informe 20260906 20260908  -> rango exacto (nuevo)
+        /informe cerradas 20260909  -> mismo filtro pero por fecha de CIERRE (nuevo)
     """
-    desde_fecha = None
-    if args:
-        if args[0].lower() != "todo":
-            desde_fecha = args[0]
-    else:
-        desde_fecha = datetime.now(db.TZ_ARG).strftime("%Y%m%d")
+    por_cierre = False
+    resto = list(args)
+    if resto and resto[0].lower() == "cerradas":
+        por_cierre = True
+        resto = resto[1:]
 
-    r = db.resumen_completo(desde_fecha)
-    etiqueta = "TODO EL HISTORIAL" if desde_fecha is None else desde_fecha
+    desde_fecha, hasta_fecha = None, None
+    if not resto:
+        desde_fecha = datetime.now(db.TZ_ARG).strftime("%Y%m%d")
+    elif resto[0].lower() != "todo":
+        desde_fecha = resto[0]
+        if len(resto) >= 2:
+            hasta_fecha = resto[1]
+
+    r = db.resumen_completo(desde_fecha, hasta_fecha, por_cierre)
+    tipo_fecha = "cierre" if por_cierre else "apertura"
+    if desde_fecha is None:
+        etiqueta = "TODO EL HISTORIAL"
+    elif hasta_fecha:
+        etiqueta = f"{desde_fecha} a {hasta_fecha} (por {tipo_fecha})"
+    else:
+        etiqueta = f"{desde_fecha} (por {tipo_fecha})" if por_cierre else desde_fecha
 
     if r["n_cerradas"] == 0:
         return f"📊 <b>Informe — {etiqueta}</b>\nSin operaciones cerradas en este período.\nCandidatos evaluados: {r['total_evaluados']} | Calificaron: {r['total_califico']}"

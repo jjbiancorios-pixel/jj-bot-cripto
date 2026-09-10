@@ -166,10 +166,24 @@ def _extraer_minimo_del_error(resp: dict):
     Intenta extraer el monto mínimo dinámico del mensaje de error de
     checkParams (Pionex lo incluye en texto, ej: "...minimum is 17.69...").
     Devuelve None si no se pudo extraer (el llamador debe manejar ese caso).
+
+    10/09 FIX CRÍTICO (bug real en producción): el regex viejo tomaba el
+    PRIMER número que encontraba en el mensaje, sin importar de dónde
+    viniera — con 1000PEPEUSDT, el mensaje de error de símbolo inválido
+    contiene "1000PEPE" (el nombre de la moneda), y el regex tomó ese
+    "1000" como si fuera el mínimo, calculando un reintento de $1.250
+    (1000 × margen 25%). No hubo pérdida real porque la apertura de
+    todas formas falló por símbolo inválido, pero el bug es real.
+    Corregido: exige que el número tenga DECIMALES (los mínimos reales
+    vistos siempre los tienen: 44.2, 17.69) — "1000" (entero, sin punto)
+    ya no matchea, pero si Pionex algún día manda un mínimo entero sin
+    decimales, esto dejaría de detectarlo (trade-off aceptado a
+    propósito, mejor no reintentar a ciegas que reintentar con un
+    número inventado).
     """
     import re
     mensaje = str(resp.get("message") or resp.get("data") or resp)
-    match = re.search(r"(\d+\.?\d*)", mensaje)
+    match = re.search(r"(\d+\.\d+)", mensaje)
     if match:
         try:
             return float(match.group(1))
@@ -188,6 +202,15 @@ def crear_grilla_futuros_segura(par: str, top: float, bottom: float, row: int,
     2. Si Pionex rechaza por mínimo, extrae el mínimo real del error,
        reintenta con mínimo + margen de seguridad (25%)
     3. Solo si checkParams pasa, se llama a create
+    4. Si CREATE falla igual (05/09 FIX — hueco real encontrado en
+       producción con PAXG, código BOT_INTERNAL_ERROR genérico sin
+       número de mínimo en el mensaje): esto es exactamente el caso que
+       Pionex advirtió — "checkParams puede dar OK y create fallar
+       después porque el mínimo cambia en el medio". Antes, esto
+       terminaba el intento de una sola vez sin reintentar. Ahora,
+       si create falla habiendo pasado checkParams, se aumenta el
+       capital por el margen de seguridad igual (aunque no haya un
+       número exacto de mínimo en el error) y se reintenta.
 
     sl_pct: SL nativo de respaldo (además de nuestro monitoreo activo),
     formato "número de porcentaje" (ej. -4.0). None = sin SL nativo.
@@ -197,6 +220,7 @@ def crear_grilla_futuros_segura(par: str, top: float, bottom: float, row: int,
     """
     capital_actual = capital_objetivo_usdt
     intentos = 0
+    ultimo_resultado = None
     while intentos <= max_reintentos:
         intentos += 1
         check = validar_parametros_grilla(par, top, bottom, row, capital_actual, leverage, trend, grid_type, sl_pct)
@@ -204,15 +228,26 @@ def crear_grilla_futuros_segura(par: str, top: float, bottom: float, row: int,
             # checkParams OK -> crear de verdad, INMEDIATAMENTE (sin demora que permita que el mínimo vuelva a moverse)
             resultado = crear_grilla_futuros(par, top, bottom, row, capital_actual, leverage, trend, grid_type, sl_pct)
             ok = resultado.get("result") is True or resultado.get("code") == 0
-            return {"ok": ok, "resultado": resultado, "capital_usado": capital_actual, "intentos": intentos}
+            if ok:
+                return {"ok": True, "resultado": resultado, "capital_usado": capital_actual, "intentos": intentos}
+            # create falló pese a que checkParams había pasado — el mínimo
+            # se movió en el medio. Reintentar con más margen si queda presupuesto.
+            ultimo_resultado = resultado
+            if intentos <= max_reintentos:
+                capital_actual = round(capital_actual * (1 + MARGEN_SOBRE_MINIMO_PCT), 8)
+                continue
+            return {"ok": False, "resultado": resultado, "capital_usado": capital_actual, "intentos": intentos}
 
         # checkParams falló -> ¿es por monto mínimo? intentar extraer y reintentar con margen
+        ultimo_resultado = check
         minimo_extraido = _extraer_minimo_del_error(check)
         if minimo_extraido and minimo_extraido > capital_actual:
-            capital_actual = round(minimo_extraido * (1 + MARGEN_SOBRE_MINIMO_PCT), 2)
+            capital_actual = round(minimo_extraido * (1 + MARGEN_SOBRE_MINIMO_PCT), 8)
             continue  # reintenta con el monto corregido
         # Falló por otro motivo, o no se pudo extraer el mínimo -> no insistir a ciegas
         return {"ok": False, "resultado": check, "capital_usado": capital_actual, "intentos": intentos}
+
+    return {"ok": False, "resultado": ultimo_resultado, "capital_usado": capital_actual, "intentos": intentos}
 
     return {"ok": False, "resultado": check, "capital_usado": capital_actual, "intentos": intentos}
 
