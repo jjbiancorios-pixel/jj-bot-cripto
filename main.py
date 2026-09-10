@@ -424,11 +424,37 @@ def analizar_par(par: str, btc: dict):
 
     # ── GATE 1: ADX + DI (umbral diferenciado por tipo de par) ──
     adx_umbral = 23 if par in PARES_MAJORS else 28
-    ADX_TECHO = 47  # 08/09 (3er ajuste): se saca el filtro de sobreextensión, se prueba techo de ADX solo
+    ADX_TECHO = 47
     di_confirma = (plus_di > minus_di) if direccion == "LARGO" else (minus_di > plus_di)
     paso_adx = adx > adx_umbral and adx <= ADX_TECHO and di_confirma
     if not paso_adx:
         db.guardar_gates_log(par, direccion, adx, adx_umbral, False, False, False, 0, 0, False)
+        return None
+
+    # ── GATE 1b: sobreextensión — vela grande vs. ATR + RSI extremo ──
+    # (10/09, rediseño con evidencia real): la versión anterior ("3 velas
+    # seguidas del mismo color") se apoyaba en la estadística de "3
+    # soldados blancos/3 cuervos negros" (82%/78% de reversión, Bulkowski)
+    # de forma imprecisa — esa tasa aplica al patrón ROMPIENDO una
+    # tendencia CONTRARIA previa, no a 3 velas de CONTINUACIÓN dentro de
+    # una tendencia que ya veníamos siguiendo (nuestro caso real, ya que
+    # el candidato ya pasó ADX+DI+persistencia). La misma búsqueda señaló
+    # el criterio que sí aplica a continuación: vela con cuerpo
+    # excepcionalmente grande vs. el ATR, combinada con RSI ya extremo
+    # (>70 u <30) — ahí sí hay evidencia de riesgo real de reversión por
+    # sobrecompra/sobreventa, no por el mero conteo de velas.
+    rsi_actual = calc_rsi(df15["close"])
+    ultima_vela = df15.iloc[-1]
+    cuerpo_ultima = abs(ultima_vela["close"] - ultima_vela["open"])
+    cuerpo_en_atr = cuerpo_ultima / atr_abs if atr_abs > 0 else 0
+    vela_alcista = ultima_vela["close"] > ultima_vela["open"]
+    UMBRAL_CUERPO_ATR = 2.0
+    sobreextendida = (
+        (direccion == "LARGO" and vela_alcista and cuerpo_en_atr > UMBRAL_CUERPO_ATR and rsi_actual > 70) or
+        (direccion == "CORTO" and not vela_alcista and cuerpo_en_atr > UMBRAL_CUERPO_ATR and rsi_actual < 30)
+    )
+    if sobreextendida:
+        db.guardar_gates_log(par, direccion, adx, adx_umbral, True, False, False, 0, 0, False)
         return None
 
     # ── GATE 2: alineación EMA20 4h ──
