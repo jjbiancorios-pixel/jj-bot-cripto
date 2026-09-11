@@ -662,9 +662,20 @@ def chequeo_rapido_riesgo():
             if ciclo_n % 30 == 1:  # print de "sigo vivo" cada ~1 min (30 ciclos de 2seg), no cada 2seg (no saturar logs)
                 print(f"🔄 chequeo_rapido_riesgo activo (ciclo {ciclo_n}) — {len(abiertas)} posición(es) abierta(s)", flush=True)
             for senal in abiertas:
-                precio_actual = get_precio(senal["par"])
+                # 11/09 FIX CRÍTICO: se cambió de la cascada externa a
+                # Pionex directo (endpoint público /market/tickers) —
+                # un precio corrupto de la cascada puede disparar un
+                # cierre real prematuro (caso real: BLURUSDT, cascada
+                # dio un precio ~29% distinto del real por un instante).
+                # La cascada queda solo como respaldo de emergencia si
+                # Pionex directo falla puntualmente.
+                precio_actual = pionex_api.obtener_precio_pionex_directo(senal["par"])
                 if precio_actual is None:
-                    print(f"⚠️ chequeo_rapido_riesgo: no se pudo obtener precio de cascada para {senal['par']} — se salta este ciclo")
+                    precio_actual = get_precio(senal["par"])
+                    if precio_actual is not None:
+                        print(f"⚠️ chequeo_rapido_riesgo: Pionex directo falló para {senal['par']}, usando cascada de respaldo")
+                if precio_actual is None:
+                    print(f"⚠️ chequeo_rapido_riesgo: no se pudo obtener precio (ni Pionex directo ni cascada) para {senal['par']} — se salta este ciclo")
                     continue
                 resultado_pct = pionex_api.calcular_resultado_actual(senal["bu_order_id"], precio_actual)
                 if resultado_pct is None:

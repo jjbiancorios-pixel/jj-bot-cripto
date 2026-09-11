@@ -82,6 +82,37 @@ def _firmar(method: str, path: str, query: str, body: str = "") -> tuple:
     return timestamp, firma
 
 
+def obtener_precio_pionex_directo(par: str):
+    """
+    11/09 FIX CRÍTICO — GET /api/v1/market/tickers, endpoint PÚBLICO de
+    Pionex (sin firma), reemplaza la cascada externa (Bybit/OKX/Binance)
+    para el chequeo de riesgo (SL/trailing). Caso real que lo motivó:
+    BLURUSDT (11/09) cerró en -5,27% real, pero nuestro aviso dijo
+    +6,17% — la cascada dio un precio ~29% distinto del real por un solo
+    instante, y ese dato corrupto activó un cierre real prematuro (no
+    solo un error de reporte). Mismo endpoint ya usado y confirmado
+    antes en este proyecto para el mismo tipo de problema (caso XMR).
+
+    Si Pionex directo falla (caída puntual del endpoint), cae a la
+    cascada como respaldo de emergencia — mejor un precio de cascada
+    que ningún precio, pero Pionex directo es SIEMPRE la primera opción.
+    """
+    base = par.upper().replace("USDT", "")
+    symbol = f"{base}_USDT_PERP"
+    url = f"{PIONEX_BASE_URL}/api/v1/market/tickers?symbol={symbol}&type=PERP"
+    try:
+        resp = requests.get(url, timeout=8).json()
+        tickers = resp.get("data", {}).get("tickers", [])
+        if tickers:
+            t = tickers[0]
+            precio = t.get("close") or t.get("last") or t.get("lastPrice")
+            if precio:
+                return float(precio)
+    except Exception as e:
+        print(f"⚠️ obtener_precio_pionex_directo({par}): {e}")
+    return None
+
+
 def obtener_precision_par(par: str) -> int:
     """Consulta GET /common/symbols para la precisión de precio (decimales) de este par."""
     base = par.upper().replace("USDT", "").replace(".PERP", "")
