@@ -44,6 +44,17 @@ def _migrar_columnas_nuevas(cur):
         except Exception:
             pass  # ya existe
 
+    columnas_gates_log_nuevas = [
+        ("atr_pct", "REAL"),
+        ("rsi", "REAL"),
+        ("volumen_ratio", "REAL"),
+    ]
+    for nombre, tipo in columnas_gates_log_nuevas:
+        try:
+            cur.execute(f"ALTER TABLE gates_log ADD COLUMN {nombre} {tipo}")
+        except Exception:
+            pass  # ya existe
+
 
 def init_db():
     """Crea las tablas si no existen. Llamar una vez al iniciar el bot."""
@@ -214,18 +225,29 @@ def esta_pausado_global() -> bool:
 # ── Gates log (diagnóstico detallado desde el día 1) ────────
 def guardar_gates_log(par: str, direccion: str, adx: float, adx_umbral_usado: float,
                        paso_adx: bool, paso_ema4h: bool, paso_funding: bool,
-                       score: int, score_momentum: int, califico: bool):
+                       score: int, score_momentum: int, califico: bool,
+                       atr_pct: float = None, rsi: float = None, volumen_ratio: float = None):
+    """
+    11/09 — Se agregaron atr_pct, rsi, volumen_ratio (opcionales, con
+    default None para no romper llamados viejos) — ANTES solo se
+    guardaban para candidatos que llegaban a abrir de verdad (tabla
+    senales), no para los rechazados. Esto impidió backtestear el
+    filtro de vela+RSI (fix25) con datos propios cuando hizo falta.
+    Guardando esto para TODOS los candidatos evaluados, el próximo
+    backtest va a poder probar variantes de ATR/RSI/volumen sin
+    depender de que abran posiciones reales primero.
+    """
     conn = _conn()
     cur = conn.cursor()
     ahora = datetime.now(TZ_ARG)
     cur.execute("""
         INSERT INTO gates_log
             (par, direccion, fecha, hora, adx, adx_umbral_usado, paso_adx, paso_ema4h,
-             paso_funding, score, score_momentum, califico, creado)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+             paso_funding, score, score_momentum, califico, atr_pct, rsi, volumen_ratio, creado)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     """, (par, direccion, ahora.strftime("%Y%m%d"), ahora.strftime("%H:%M"), adx, adx_umbral_usado,
           int(paso_adx), int(paso_ema4h), int(paso_funding), score, score_momentum, int(califico),
-          ahora.isoformat()))
+          atr_pct, rsi, volumen_ratio, ahora.isoformat()))
     conn.commit()
     conn.close()
 

@@ -419,48 +419,40 @@ def analizar_par(par: str, btc: dict):
     signo_actual = 1 if direccion == "LARGO" else -1
     persistio = bool((np.sign(diff_serie) == signo_actual).all())
     if not persistio:
-        db.guardar_gates_log(par, "SIN_PERSISTENCIA", adx, 0, False, False, False, 0, 0, False)
+        db.guardar_gates_log(par, "SIN_PERSISTENCIA", adx, 0, False, False, False, 0, 0, False, atr_pct, None, None)
         return None
 
     # ── GATE 1: ADX + DI (umbral diferenciado por tipo de par) ──
+    # 11/09 — REVERTIDO a los parámetros validados por backtest real
+    # sobre 196 operaciones (bot_cripto_backup_20260911): score>=8 +
+    # ADX techo 37 dio +56,31% neto / 76,1% win rate (n=88), la mejor
+    # combinación robusta encontrada. El techo se había subido a 47 y
+    # abandonado a 37 antes por impaciencia (0 señales una noche), sin
+    # evidencia real de que estuviera mal — el backtest confirma que 37
+    # era la decisión correcta. También coincide con doctrina externa
+    # (ADX>40-45 = "blow-off top"/fase de agotamiento, documentado en
+    # múltiples fuentes independientes).
     adx_umbral = 23 if par in PARES_MAJORS else 28
-    ADX_TECHO = 47
+    ADX_TECHO = 37
     di_confirma = (plus_di > minus_di) if direccion == "LARGO" else (minus_di > plus_di)
     paso_adx = adx > adx_umbral and adx <= ADX_TECHO and di_confirma
     if not paso_adx:
-        db.guardar_gates_log(par, direccion, adx, adx_umbral, False, False, False, 0, 0, False)
+        db.guardar_gates_log(par, direccion, adx, adx_umbral, False, False, False, 0, 0, False, atr_pct, None, None)
         return None
 
-    # ── GATE 1b: sobreextensión — vela grande vs. ATR + RSI extremo ──
-    # (10/09, rediseño con evidencia real): la versión anterior ("3 velas
-    # seguidas del mismo color") se apoyaba en la estadística de "3
-    # soldados blancos/3 cuervos negros" (82%/78% de reversión, Bulkowski)
-    # de forma imprecisa — esa tasa aplica al patrón ROMPIENDO una
-    # tendencia CONTRARIA previa, no a 3 velas de CONTINUACIÓN dentro de
-    # una tendencia que ya veníamos siguiendo (nuestro caso real, ya que
-    # el candidato ya pasó ADX+DI+persistencia). La misma búsqueda señaló
-    # el criterio que sí aplica a continuación: vela con cuerpo
-    # excepcionalmente grande vs. el ATR, combinada con RSI ya extremo
-    # (>70 u <30) — ahí sí hay evidencia de riesgo real de reversión por
-    # sobrecompra/sobreventa, no por el mero conteo de velas.
-    rsi_actual = calc_rsi(df15["close"])
-    ultima_vela = df15.iloc[-1]
-    cuerpo_ultima = abs(ultima_vela["close"] - ultima_vela["open"])
-    cuerpo_en_atr = cuerpo_ultima / atr_abs if atr_abs > 0 else 0
-    vela_alcista = ultima_vela["close"] > ultima_vela["open"]
-    UMBRAL_CUERPO_ATR = 2.0
-    sobreextendida = (
-        (direccion == "LARGO" and vela_alcista and cuerpo_en_atr > UMBRAL_CUERPO_ATR and rsi_actual > 70) or
-        (direccion == "CORTO" and not vela_alcista and cuerpo_en_atr > UMBRAL_CUERPO_ATR and rsi_actual < 30)
-    )
-    if sobreextendida:
-        db.guardar_gates_log(par, direccion, adx, adx_umbral, True, False, False, 0, 0, False)
-        return None
+    # 11/09 — Sacado el filtro de sobreextensión (vela vs ATR + RSI):
+    # sin evidencia propia (no se pudo backtestear, esos datos no se
+    # guardaban para candidatos rechazados) y coincide con el cambio
+    # más reciente antes del peor resultado del día (-27,36% neto,
+    # 53,8% win rate) — sospecha razonable sin poder confirmarla del
+    # todo. El filtro de régimen BTC (probado y descartado por
+    # backtest: -70,23% neto, peor que no usarlo) tampoco se agrega.
+    rsi_actual = calc_rsi(df15["close"])  # se sigue calculando: ahora se GUARDA en gates_log para el próximo backtest
 
     # ── GATE 2: alineación EMA20 4h ──
     paso_ema4h = (precio > ema20_4h) if direccion == "LARGO" else (precio < ema20_4h)
     if not paso_ema4h:
-        db.guardar_gates_log(par, direccion, adx, adx_umbral, True, False, False, 0, 0, False)
+        db.guardar_gates_log(par, direccion, adx, adx_umbral, True, False, False, 0, 0, False, atr_pct, rsi_actual, None)
         return None
 
     # ── GATE 3: funding rate no extremo ──
@@ -472,7 +464,7 @@ def analizar_par(par: str, btc: dict):
         elif direccion == "CORTO" and funding < -FUNDING_UMBRAL_PCT:
             paso_funding = False
     if not paso_funding:
-        db.guardar_gates_log(par, direccion, adx, adx_umbral, True, True, False, 0, 0, False)
+        db.guardar_gates_log(par, direccion, adx, adx_umbral, True, True, False, 0, 0, False, atr_pct, rsi_actual, None)
         return None
 
     # ── SCORE (máx 10, umbral 7) — solo llegan acá los que ya pasaron los 3 gates ──
@@ -525,14 +517,15 @@ def analizar_par(par: str, btc: dict):
     # Volumen (umbral 1.5x)
     vol_prom = df15["vol"].iloc[-21:-1].mean()
     vol_actual = df15["vol"].iloc[-1]
-    if vol_prom > 0 and vol_actual / vol_prom >= VOLUMEN_RATIO_MINIMO:
-        score_independiente += 1; razones.append(f"Volumen {vol_actual/vol_prom:.1f}x")
+    volumen_ratio = vol_actual / vol_prom if vol_prom > 0 else None
+    if volumen_ratio is not None and volumen_ratio >= VOLUMEN_RATIO_MINIMO:
+        score_independiente += 1; razones.append(f"Volumen {volumen_ratio:.1f}x")
 
     score_total = score_momentum + score_independiente
     califico = score_total >= SCORE_UMBRAL
 
     db.guardar_gates_log(par, direccion, adx, adx_umbral, True, True, True,
-                          score_total, score_momentum, califico)
+                          score_total, score_momentum, califico, atr_pct, rsi_actual, volumen_ratio)
 
     if not califico:
         return None
