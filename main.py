@@ -432,8 +432,19 @@ def analizar_par(par: str, btc: dict):
     # era la decisión correcta. También coincide con doctrina externa
     # (ADX>40-45 = "blow-off top"/fase de agotamiento, documentado en
     # múltiples fuentes independientes).
+    #
+    # 13/09 — SEGUNDO hallazgo, con 204 operaciones: LARGO rinde bastante
+    # peor que CORTO (60,0% vs 72,5% win rate), y el ADX promedio de las
+    # LARGO es sistemáticamente más alto que el de las CORTO (≈40 vs
+    # ≈35) — entran más tarde en el movimiento. Backtest específico:
+    # bajar el techo de LARGO a 33 reduce la pérdida neta de -72,73% a
+    # -7,74% (mejora fuerte, aunque no la vuelve positiva del todo — hay
+    # algo más que el ADX no termina de explicar). Techo de CORTO se
+    # mantiene en 37 (ya validado). Techos ahora ASIMÉTRICOS por dirección.
     adx_umbral = 23 if par in PARES_MAJORS else 28
-    ADX_TECHO = 37
+    ADX_TECHO_LARGO = 33
+    ADX_TECHO_CORTO = 37
+    ADX_TECHO = ADX_TECHO_LARGO if direccion == "LARGO" else ADX_TECHO_CORTO
     di_confirma = (plus_di > minus_di) if direccion == "LARGO" else (minus_di > plus_di)
     paso_adx = adx > adx_umbral and adx <= ADX_TECHO and di_confirma
     if not paso_adx:
@@ -615,6 +626,14 @@ def ciclo_seleccion():
             continue
         if not candidato:
             continue
+
+        # 13/09 — Simulación paralela (sin capital real), SIEMPRE que
+        # no haya ya una abierta para este par — corre pase lo que pase
+        # con la pausa, para tener datos de comparación constantes.
+        if not db.par_tiene_simulacion_abierta(par):
+            db.crear_simulacion(par, candidato["direccion"], candidato.get("score"),
+                                 candidato.get("adx"), candidato.get("atr_pct"), candidato["precio"])
+
         if pausado:
             continue  # ya quedó registrado en gates_log, no abre nada real
         # 10/09: modo cauto (BTC cambió de tendencia hace poco) — límite
@@ -738,6 +757,20 @@ def chequeo_rapido_riesgo():
                         )
                     except Exception as e:
                         print(f"⚠️ No se pudo avisar del cierre de {senal['par']} por Telegram (pero sí quedó cerrada en nuestra base): {e}", flush=True)
+
+            # ── 13/09: chequeo de simulaciones (sin capital real) ──
+            for sim in db.simulaciones_abiertas():
+                precio_actual_sim = get_precio(sim["par"])
+                if precio_actual_sim is None:
+                    continue
+                cambio_precio_pct = (precio_actual_sim - sim["precio_entrada"]) / sim["precio_entrada"] * 100
+                signo = 1 if sim["direccion"] == "LARGO" else -1
+                resultado_actual_sim = cambio_precio_pct * signo * gestion_riesgo.LEVERAGE_FIJO
+                decision_sim = gestion_riesgo.evaluar_cierre_simulado(sim["direccion"], sim["atr_pct"], sim["pico_maximo_pct"], resultado_actual_sim)
+                if decision_sim["cerrar"]:
+                    db.cerrar_simulacion(sim["id"], resultado_actual_sim, decision_sim["motivo"])
+                else:
+                    db.actualizar_pico_simulacion(sim["id"], decision_sim["pico_nuevo"])
         except Exception as e:
             print(f"⚠️ chequeo_rapido_riesgo: {e}", flush=True)
         time.sleep(2)

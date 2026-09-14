@@ -285,6 +285,25 @@ def _cmd_informe(args: list) -> str:
     return "\n".join(lineas)
 
 
+def _cmd_simulaciones(args: list) -> str:
+    """13/09 — resultados de la simulación paralela (sin capital real), separados por LARGO/CORTO."""
+    desde_fecha = None
+    if args and args[0].lower() != "todo":
+        desde_fecha = args[0]
+    r = db.resumen_simulaciones(desde_fecha)
+    etiqueta = "TODO EL HISTORIAL" if desde_fecha is None else desde_fecha
+    if r["n_cerradas"] == 0:
+        return f"🧪 <b>Simulaciones — {etiqueta}</b>\nSin simulaciones cerradas todavía."
+    lineas = [
+        f"🧪 <b>Simulaciones (sin capital real) — {etiqueta}</b>",
+        f"Cerradas: {r['n_cerradas']} | ✅ {r['n_ganadoras']} | ❌ {r['n_perdedoras']} | Win rate: {r['win_rate_pct']}%",
+        f"<b>Resultado neto: {r['resultado_neto_pct']:+.2f}%</b>",
+    ]
+    for d, dat in r.get("por_direccion", {}).items():
+        lineas.append(f"  {d}: n={dat['n']} | win rate {dat['win_rate']}% | neto {dat['neto']:+.2f}%")
+    return "\n".join(lineas)
+
+
 def _cmd_gates(args: list) -> str:
     if not args:
         return "Uso: /gates PAR\nEj: /gates BTC"
@@ -330,6 +349,8 @@ def procesar_comando(texto: str) -> str:
         return _cmd_backup_db()
     elif cmd == "/gates":
         return _cmd_gates(args)
+    elif cmd == "/simulaciones":
+        return _cmd_simulaciones(args)
     elif cmd == "/informe":
         return _cmd_informe(args)
     elif cmd == "/debug_orden":

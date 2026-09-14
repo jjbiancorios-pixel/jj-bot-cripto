@@ -155,6 +155,7 @@ def init_db():
     """)
 
     _migrar_columnas_nuevas(cur)
+    _crear_tabla_simulaciones(cur)
 
     conn.commit()
     conn.close()
@@ -194,6 +195,109 @@ def contar_posiciones_por_direccion(direccion: str) -> int:
     n = cur.fetchone()[0]
     conn.close()
     return n
+
+
+def _crear_tabla_simulaciones(cur):
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS simulaciones (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            par TEXT NOT NULL,
+            direccion TEXT NOT NULL,
+            score INTEGER,
+            adx REAL,
+            atr_pct REAL,
+            precio_entrada REAL,
+            pico_maximo_pct REAL DEFAULT 0,
+            fecha TEXT NOT NULL,
+            hora TEXT NOT NULL,
+            cerrado INTEGER DEFAULT 0,
+            resultado_pct REAL,
+            motivo_cierre TEXT,
+            fecha_cierre TEXT,
+            hora_cierre TEXT,
+            creado TEXT NOT NULL
+        )
+    """)
+
+
+def crear_simulacion(par, direccion, score, adx, atr_pct, precio_entrada) -> int:
+    conn = _conn()
+    cur = conn.cursor()
+    ahora = datetime.now(TZ_ARG)
+    cur.execute("""
+        INSERT INTO simulaciones (par, direccion, score, adx, atr_pct, precio_entrada, fecha, hora, creado)
+        VALUES (?,?,?,?,?,?,?,?,?)
+    """, (par, direccion, score, adx, atr_pct, precio_entrada, ahora.strftime("%Y%m%d"), ahora.strftime("%H:%M"), ahora.isoformat()))
+    conn.commit()
+    sim_id = cur.lastrowid
+    conn.close()
+    return sim_id
+
+
+def par_tiene_simulacion_abierta(par: str) -> bool:
+    conn = _conn()
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM simulaciones WHERE cerrado = 0 AND par = ?", (par,))
+    n = cur.fetchone()[0]
+    conn.close()
+    return n > 0
+
+
+def simulaciones_abiertas() -> list:
+    conn = _conn()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM simulaciones WHERE cerrado = 0")
+    rows = [dict(r) for r in cur.fetchall()]
+    conn.close()
+    return rows
+
+
+def actualizar_pico_simulacion(sim_id: int, pico_nuevo: float):
+    conn = _conn()
+    cur = conn.cursor()
+    cur.execute("UPDATE simulaciones SET pico_maximo_pct = ? WHERE id = ?", (pico_nuevo, sim_id))
+    conn.commit()
+    conn.close()
+
+
+def cerrar_simulacion(sim_id: int, resultado_pct: float, motivo: str):
+    conn = _conn()
+    cur = conn.cursor()
+    ahora = datetime.now(TZ_ARG)
+    cur.execute("""
+        UPDATE simulaciones SET cerrado = 1, resultado_pct = ?, motivo_cierre = ?, fecha_cierre = ?, hora_cierre = ?
+        WHERE id = ?
+    """, (resultado_pct, motivo, ahora.strftime("%Y%m%d"), ahora.strftime("%H:%M"), sim_id))
+    conn.commit()
+    conn.close()
+
+
+def resumen_simulaciones(desde_fecha: str = None) -> dict:
+    conn = _conn()
+    cur = conn.cursor()
+    query = "SELECT * FROM simulaciones WHERE cerrado = 1 AND resultado_pct IS NOT NULL"
+    params = ()
+    if desde_fecha:
+        query += " AND fecha >= ?"
+        params = (desde_fecha,)
+    cur.execute(query, params)
+    cerradas = [dict(r) for r in cur.fetchall()]
+    conn.close()
+    if not cerradas:
+        return {"n_cerradas": 0}
+    ganadoras = [f for f in cerradas if f["resultado_pct"] > 0]
+    por_direccion = {}
+    for d in ["LARGO", "CORTO"]:
+        sub = [f for f in cerradas if f.get("direccion") == d]
+        if sub:
+            g = [f for f in sub if f["resultado_pct"] > 0]
+            por_direccion[d] = {"n": len(sub), "win_rate": round(len(g) / len(sub) * 100, 1), "neto": round(sum(f["resultado_pct"] for f in sub), 2)}
+    return {
+        "n_cerradas": len(cerradas), "n_ganadoras": len(ganadoras), "n_perdedoras": len(cerradas) - len(ganadoras),
+        "win_rate_pct": round(len(ganadoras) / len(cerradas) * 100, 1),
+        "resultado_neto_pct": round(sum(f["resultado_pct"] for f in cerradas), 2),
+        "por_direccion": por_direccion,
+    }
 
 
 def pausar_todo(motivo: str = ""):

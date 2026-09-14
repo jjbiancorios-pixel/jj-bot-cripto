@@ -154,6 +154,39 @@ def evaluar_cierre(senal: dict, resultado_actual_pct: float, precio_actual: floa
     return {"cerrar": False, "motivo": None}
 
 
+def evaluar_cierre_simulado(direccion: str, atr_pct: float, pico_maximo_pct: float, resultado_actual_pct: float) -> dict:
+    """
+    13/09 — Versión SIN efectos en la base (no escribe en `senales`,
+    para usar con simulaciones sin capital real). Misma lógica central
+    que evaluar_cierre (SL fijo + trailing por ATR), sin los mecanismos
+    de "fuera de rango" ni "BTC en contra" (simplificación consciente,
+    esos 2 dependen de datos específicos de la grilla real).
+    """
+    if resultado_actual_pct <= SL_FIJO_PCT:
+        return {"cerrar": True, "motivo": "stop_loss", "pico_nuevo": pico_maximo_pct}
+
+    pico_actual = max(pico_maximo_pct or 0, resultado_actual_pct)
+    nombre_tramo, retroceso_pct = calcular_tramo(pico_actual, atr_pct)
+    umbral_breakeven, _, _ = _umbrales_por_atr(atr_pct)
+    breakeven_activo = pico_actual >= umbral_breakeven
+
+    if not breakeven_activo:
+        return {"cerrar": False, "motivo": None, "pico_nuevo": pico_actual}
+
+    if retroceso_pct is None:
+        if resultado_actual_pct <= 0:
+            return {"cerrar": True, "motivo": "breakeven", "pico_nuevo": pico_actual}
+        return {"cerrar": False, "motivo": None, "pico_nuevo": pico_actual}
+
+    piso_permitido = pico_actual * (1 - retroceso_pct)
+    if resultado_actual_pct <= piso_permitido:
+        return {"cerrar": True, "motivo": "trailing_tp", "pico_nuevo": pico_actual}
+    if resultado_actual_pct <= 0:
+        return {"cerrar": True, "motivo": "breakeven", "pico_nuevo": pico_actual}
+
+    return {"cerrar": False, "motivo": None, "pico_nuevo": pico_actual}
+
+
 def hay_lugar_para_abrir() -> dict:
     """Chequea el tope de 6 posiciones simultáneas y el tope de 2 aperturas por ciclo de 15min."""
     abiertas = db.contar_posiciones_abiertas()
