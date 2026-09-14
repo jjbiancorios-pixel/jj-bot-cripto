@@ -304,6 +304,41 @@ def _cmd_simulaciones(args: list) -> str:
     return "\n".join(lineas)
 
 
+def _cmd_directivas(args: list) -> str:
+    """14/09 — resultados de la simulación de Directivas de Optimización (sin capital real)."""
+    desde_fecha = None
+    if args and args[0].lower() != "todo":
+        desde_fecha = args[0]
+    r = db.resumen_simulaciones_directivas(desde_fecha)
+    etiqueta = "TODO EL HISTORIAL" if desde_fecha is None else desde_fecha
+    if r["n_cerradas"] == 0:
+        return f"📐 <b>Directivas — {etiqueta}</b>\nSin simulaciones cerradas todavía."
+    return (f"📐 <b>Directivas de Optimización (sin capital real) — {etiqueta}</b>\n"
+            f"Cerradas: {r['n_cerradas']} | ✅ {r['n_ganadoras']} | ❌ {r['n_perdedoras']} | Win rate: {r['win_rate_pct']}%\n"
+            f"<b>Resultado neto: {r['resultado_neto_pct']:+.2f}%</b>")
+
+
+def _cmd_comparar(args: list) -> str:
+    """14/09 — comparación lado a lado de las 3 estrategias en análisis: real (fix28), simulación original, Directivas."""
+    desde_fecha = None
+    if args and args[0].lower() != "todo":
+        desde_fecha = args[0]
+    r_real = db.resumen_completo(desde_fecha)
+    r_sim = db.resumen_simulaciones(desde_fecha)
+    r_dir = db.resumen_simulaciones_directivas(desde_fecha)
+    etiqueta = "TODO EL HISTORIAL" if desde_fecha is None else desde_fecha
+
+    def _fmt(r):
+        if r.get("n_cerradas", 0) == 0:
+            return "sin cierres todavía"
+        return f"n={r['n_cerradas']} | win rate {r['win_rate_pct']}% | neto {r['resultado_neto_pct']:+.2f}%"
+
+    return (f"📊 <b>Comparación de estrategias — {etiqueta}</b>\n\n"
+            f"🔴 Real (fix28): {_fmt(r_real)}\n"
+            f"🧪 Simulación original: {_fmt(r_sim)}\n"
+            f"📐 Directivas: {_fmt(r_dir)}")
+
+
 def _cmd_gates(args: list) -> str:
     if not args:
         return "Uso: /gates PAR\nEj: /gates BTC"
@@ -351,6 +386,10 @@ def procesar_comando(texto: str) -> str:
         return _cmd_gates(args)
     elif cmd == "/simulaciones":
         return _cmd_simulaciones(args)
+    elif cmd == "/directivas":
+        return _cmd_directivas(args)
+    elif cmd == "/comparar":
+        return _cmd_comparar(args)
     elif cmd == "/informe":
         return _cmd_informe(args)
     elif cmd == "/debug_orden":

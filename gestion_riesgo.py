@@ -187,6 +187,37 @@ def evaluar_cierre_simulado(direccion: str, atr_pct: float, pico_maximo_pct: flo
     return {"cerrar": False, "motivo": None, "pico_nuevo": pico_actual}
 
 
+SL_DIRECTIVAS_PCT = -4.5  # 14/09 — "JJ_Cripto_Bot_Directivas_Optimizacion.pdf", confirmado por Juanjo
+PICO_ACTIVACION_DIRECTIVAS_PCT = 2.0
+RETROCESO_DIRECTIVAS_PCT = 10  # fijo, no escalado — "elimina la ambición de capturar tendencias macro"
+
+
+def evaluar_cierre_directivas(direccion: str, pico_maximo_pct: float, resultado_actual_pct: float) -> dict:
+    """
+    14/09 — Simulación de "JJ_Cripto_Bot_Directivas_Optimizacion.pdf":
+    SL fijo -4,5% (más ajustado que fix28) y UN SOLO tramo de trailing
+    (no 3 escalados por ATR) — activa en pico≥2%, retrocede un 10% fijo
+    desde el pico. Pura, sin efectos en la base (para usar en
+    simulación, no en posiciones reales).
+
+    OJO — contradice nuestro propio backtest de 196 operaciones reales
+    (13/09), que encontró -7,5% como el SL óptimo real, con los SL más
+    ajustados (-4/-5/-6%) sistemáticamente peores por whipsaw. Por eso
+    corre como simulación, NO como la estrategia real — para que los
+    datos decidan en vez de asumir que el documento tiene razón.
+    """
+    if resultado_actual_pct <= SL_DIRECTIVAS_PCT:
+        return {"cerrar": True, "motivo": "stop_loss", "pico_nuevo": pico_maximo_pct}
+
+    pico_actual = max(pico_maximo_pct or 0, resultado_actual_pct)
+    if pico_actual >= PICO_ACTIVACION_DIRECTIVAS_PCT:
+        piso_permitido = pico_actual * (1 - RETROCESO_DIRECTIVAS_PCT / 100)
+        if resultado_actual_pct <= piso_permitido:
+            return {"cerrar": True, "motivo": "trailing_directivas", "pico_nuevo": pico_actual}
+
+    return {"cerrar": False, "motivo": None, "pico_nuevo": pico_actual}
+
+
 def hay_lugar_para_abrir() -> dict:
     """Chequea el tope de 6 posiciones simultáneas y el tope de 2 aperturas por ciclo de 15min."""
     abiertas = db.contar_posiciones_abiertas()

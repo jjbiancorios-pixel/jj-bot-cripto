@@ -548,7 +548,7 @@ def analizar_par(par: str, btc: dict):
         "adx": round(adx, 2), "adx_umbral_usado": adx_umbral, "di_confirma": di_confirma,
         "ema4h_alineada": paso_ema4h, "funding_rate": funding, "funding_bloqueo": False,
         "score": score_total, "score_momentum": score_momentum, "razones": razones,
-        "atr_pct": round(atr_pct, 3),
+        "atr_pct": round(atr_pct, 3), "rsi": round(rsi, 2), "stoch_rsi": round(stoch, 2),
         "rango_pct": grid["rango_pct"], "rango_bajo": round(grid["bottom"], 6),
         "rango_alto": round(grid["top"], 6), "grillas": grid["grillas"],
     }
@@ -633,6 +633,21 @@ def ciclo_seleccion():
         if not db.par_tiene_simulacion_abierta(par):
             db.crear_simulacion(par, candidato["direccion"], candidato.get("score"),
                                  candidato.get("adx"), candidato.get("atr_pct"), candidato["precio"])
+
+        # 14/09 — Simulación de "Directivas de Optimización": mismo
+        # candidato (ya pasó los gates reales), pero con un filtro EXTRA
+        # más estricto para LARGO — techo de ADX 30 (no 33) y bloqueo
+        # por osciladores en sobrecompra macro (RSI>70 o StochRSI>80).
+        # CORTO no cambia (el documento no lo menciona).
+        calif_directivas = True
+        if candidato["direccion"] == "LARGO":
+            if candidato.get("adx", 0) > 30:
+                calif_directivas = False
+            if (candidato.get("rsi") or 0) > 70 or (candidato.get("stoch_rsi") or 0) > 80:
+                calif_directivas = False
+        if calif_directivas and not db.par_tiene_simulacion_directivas_abierta(par):
+            db.crear_simulacion_directivas(par, candidato["direccion"], candidato.get("score"),
+                                            candidato.get("adx"), candidato.get("atr_pct"), candidato["precio"])
 
         if pausado:
             continue  # ya quedó registrado en gates_log, no abre nada real
@@ -771,6 +786,20 @@ def chequeo_rapido_riesgo():
                     db.cerrar_simulacion(sim["id"], resultado_actual_sim, decision_sim["motivo"])
                 else:
                     db.actualizar_pico_simulacion(sim["id"], decision_sim["pico_nuevo"])
+
+            # ── 14/09: chequeo de simulaciones de Directivas (sin capital real) ──
+            for sim in db.simulaciones_directivas_abiertas():
+                precio_actual_sim = get_precio(sim["par"])
+                if precio_actual_sim is None:
+                    continue
+                cambio_precio_pct = (precio_actual_sim - sim["precio_entrada"]) / sim["precio_entrada"] * 100
+                signo = 1 if sim["direccion"] == "LARGO" else -1
+                resultado_actual_sim = cambio_precio_pct * signo * gestion_riesgo.LEVERAGE_FIJO
+                decision_sim = gestion_riesgo.evaluar_cierre_directivas(sim["direccion"], sim["pico_maximo_pct"], resultado_actual_sim)
+                if decision_sim["cerrar"]:
+                    db.cerrar_simulacion_directivas(sim["id"], resultado_actual_sim, decision_sim["motivo"])
+                else:
+                    db.actualizar_pico_simulacion_directivas(sim["id"], decision_sim["pico_nuevo"])
         except Exception as e:
             print(f"⚠️ chequeo_rapido_riesgo: {e}", flush=True)
         time.sleep(2)
