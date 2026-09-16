@@ -364,24 +364,38 @@ def _cmd_directivas(args: list) -> str:
 
 
 def _cmd_comparar(args: list) -> str:
-    """14/09 — comparación lado a lado de las 3 estrategias en análisis: real (fix28), simulación original, Directivas."""
+    """
+    14/09, corregido 16/09 — comparación lado a lado de las 4
+    estrategias en análisis: real (fix28), simulación original,
+    Directivas, y combo (entrada Directivas + salida original).
+
+    16/09: usa la fórmula PONDERADA por capital (documentada en v16,
+    encontrada en conocimiento del proyecto) en vez de la suma simple —
+    la suma simple inflaba el resultado ~20x (cada operación usa solo
+    5% del capital real, pero sumaba su % completo).
+    """
     desde_fecha = None
     if args and args[0].lower() != "todo":
         desde_fecha = args[0]
-    r_real = db.resumen_completo(desde_fecha)
-    r_sim = db.resumen_simulaciones(desde_fecha)
-    r_dir = db.resumen_simulaciones_directivas(desde_fecha)
     etiqueta = "TODO EL HISTORIAL" if desde_fecha is None else desde_fecha
 
     def _fmt(r):
         if r.get("n_cerradas", 0) == 0:
             return "sin cierres todavía"
-        return f"n={r['n_cerradas']} | win rate {r['win_rate_pct']}% | neto {r['resultado_neto_pct']:+.2f}%"
+        ponderado = r.get("neto_ponderado_pct")
+        ponderado_txt = f"{ponderado:+.2f}%" if ponderado is not None else "s/d (falta capital de hoy)"
+        return f"n={r['n_cerradas']} | win rate {r['win_rate_pct']}% | <b>neto real: {ponderado_txt}</b> (suma simple: {r['resultado_neto_pct']:+.2f}%)"
+
+    r_real = db.resumen_ponderado("senales", desde_fecha)
+    r_sim = db.resumen_ponderado("simulaciones", desde_fecha)
+    r_dir = db.resumen_ponderado("simulaciones_directivas", desde_fecha)
+    r_combo = db.resumen_ponderado("simulaciones_combo", desde_fecha)
 
     return (f"📊 <b>Comparación de estrategias — {etiqueta}</b>\n\n"
-            f"🔴 Real (fix28): {_fmt(r_real)}\n"
-            f"🧪 Simulación original: {_fmt(r_sim)}\n"
-            f"📐 Directivas: {_fmt(r_dir)}")
+            f"🔴 Real (fix28): {_fmt(r_real)}\n\n"
+            f"🧪 Simulación original: {_fmt(r_sim)}\n\n"
+            f"📐 Directivas: {_fmt(r_dir)}\n\n"
+            f"🔀 Combo (entrada Directivas + salida original): {_fmt(r_combo)}")
 
 
 def _cmd_gates(args: list) -> str:

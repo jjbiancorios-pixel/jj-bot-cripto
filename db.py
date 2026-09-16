@@ -239,16 +239,62 @@ def _crear_tabla_simulaciones(cur):
             creado TEXT NOT NULL
         )
     """)
+    # 16/09 — 4ta simulación: entrada de Directivas (ADX≤30 LARGO +
+    # bloqueo sobrecompra) combinada con la SALIDA de la simulación
+    # original (SL -7.5% + trailing 3 tramos por ATR, ya validada con
+    # backtest propio) — combinación que todavía no se había probado.
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS simulaciones_combo (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            par TEXT NOT NULL,
+            direccion TEXT NOT NULL,
+            score INTEGER,
+            adx REAL,
+            atr_pct REAL,
+            precio_entrada REAL,
+            pico_maximo_pct REAL DEFAULT 0,
+            capital_asignado REAL,
+            fecha TEXT NOT NULL,
+            hora TEXT NOT NULL,
+            cerrado INTEGER DEFAULT 0,
+            resultado_pct REAL,
+            motivo_cierre TEXT,
+            fecha_cierre TEXT,
+            hora_cierre TEXT,
+            creado TEXT NOT NULL
+        )
+    """)
+
+    # 16/09: capital_asignado para calcular el resultado PONDERADO (no
+    # la suma simple) — misma fórmula documentada en v16: cada
+    # operación aporta (resultado_pct/100 * capital_asignado) en USD,
+    # el total se divide por el capital total de la cartera. Las
+    # simulaciones usan el mismo 5% que usaría la real, para que la
+    # comparación sea de manzanas con manzanas.
+    for tabla in ("simulaciones", "simulaciones_directivas", "simulaciones_combo"):
+        try:
+            cur.execute(f"ALTER TABLE {tabla} ADD COLUMN capital_asignado REAL")
+        except Exception:
+            pass  # ya existe
+
+
+def _capital_asignado_estimado() -> float:
+    """5% del capital de hoy (mismo % que usaría una posición real) — para que las simulaciones sean comparables con capital real."""
+    cap = obtener_capital_diario()
+    if not cap:
+        return 0.0
+    return round(cap["capital_dia"] * 0.05, 2)
 
 
 def crear_simulacion(par, direccion, score, adx, atr_pct, precio_entrada) -> int:
     conn = _conn()
     cur = conn.cursor()
     ahora = datetime.now(TZ_ARG)
+    capital_asignado = _capital_asignado_estimado()
     cur.execute("""
-        INSERT INTO simulaciones (par, direccion, score, adx, atr_pct, precio_entrada, fecha, hora, creado)
-        VALUES (?,?,?,?,?,?,?,?,?)
-    """, (par, direccion, score, adx, atr_pct, precio_entrada, ahora.strftime("%Y%m%d"), ahora.strftime("%H:%M"), ahora.isoformat()))
+        INSERT INTO simulaciones (par, direccion, score, adx, atr_pct, precio_entrada, capital_asignado, fecha, hora, creado)
+        VALUES (?,?,?,?,?,?,?,?,?,?)
+    """, (par, direccion, score, adx, atr_pct, precio_entrada, capital_asignado, ahora.strftime("%Y%m%d"), ahora.strftime("%H:%M"), ahora.isoformat()))
     conn.commit()
     sim_id = cur.lastrowid
     conn.close()
@@ -335,14 +381,69 @@ def crear_simulacion_directivas(par, direccion, score, adx, atr_pct, precio_entr
     conn = _conn()
     cur = conn.cursor()
     ahora = datetime.now(TZ_ARG)
+    capital_asignado = _capital_asignado_estimado()
     cur.execute("""
-        INSERT INTO simulaciones_directivas (par, direccion, score, adx, atr_pct, precio_entrada, fecha, hora, creado)
-        VALUES (?,?,?,?,?,?,?,?,?)
-    """, (par, direccion, score, adx, atr_pct, precio_entrada, ahora.strftime("%Y%m%d"), ahora.strftime("%H:%M"), ahora.isoformat()))
+        INSERT INTO simulaciones_directivas (par, direccion, score, adx, atr_pct, precio_entrada, capital_asignado, fecha, hora, creado)
+        VALUES (?,?,?,?,?,?,?,?,?,?)
+    """, (par, direccion, score, adx, atr_pct, precio_entrada, capital_asignado, ahora.strftime("%Y%m%d"), ahora.strftime("%H:%M"), ahora.isoformat()))
     conn.commit()
     sim_id = cur.lastrowid
     conn.close()
     return sim_id
+
+
+def par_tiene_simulacion_combo_abierta(par: str) -> bool:
+    conn = _conn()
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM simulaciones_combo WHERE cerrado = 0 AND par = ?", (par,))
+    n = cur.fetchone()[0]
+    conn.close()
+    return n > 0
+
+
+def crear_simulacion_combo(par, direccion, score, adx, atr_pct, precio_entrada) -> int:
+    """16/09 — 4ta simulación: entrada de Directivas (ADX≤30 LARGO + bloqueo sobrecompra) + salida de la simulación original (SL -7.5% + trailing 3 tramos por ATR)."""
+    conn = _conn()
+    cur = conn.cursor()
+    ahora = datetime.now(TZ_ARG)
+    capital_asignado = _capital_asignado_estimado()
+    cur.execute("""
+        INSERT INTO simulaciones_combo (par, direccion, score, adx, atr_pct, precio_entrada, capital_asignado, fecha, hora, creado)
+        VALUES (?,?,?,?,?,?,?,?,?,?)
+    """, (par, direccion, score, adx, atr_pct, precio_entrada, capital_asignado, ahora.strftime("%Y%m%d"), ahora.strftime("%H:%M"), ahora.isoformat()))
+    conn.commit()
+    sim_id = cur.lastrowid
+    conn.close()
+    return sim_id
+
+
+def simulaciones_combo_abiertas() -> list:
+    conn = _conn()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM simulaciones_combo WHERE cerrado = 0")
+    rows = [dict(r) for r in cur.fetchall()]
+    conn.close()
+    return rows
+
+
+def actualizar_pico_simulacion_combo(sim_id: int, pico_nuevo: float):
+    conn = _conn()
+    cur = conn.cursor()
+    cur.execute("UPDATE simulaciones_combo SET pico_maximo_pct = ? WHERE id = ?", (pico_nuevo, sim_id))
+    conn.commit()
+    conn.close()
+
+
+def cerrar_simulacion_combo(sim_id: int, resultado_pct: float, motivo: str):
+    conn = _conn()
+    cur = conn.cursor()
+    ahora = datetime.now(TZ_ARG)
+    cur.execute("""
+        UPDATE simulaciones_combo SET cerrado = 1, resultado_pct = ?, motivo_cierre = ?, fecha_cierre = ?, hora_cierre = ?
+        WHERE id = ?
+    """, (resultado_pct, motivo, ahora.strftime("%Y%m%d"), ahora.strftime("%H:%M"), sim_id))
+    conn.commit()
+    conn.close()
 
 
 def simulaciones_directivas_abiertas() -> list:
@@ -612,6 +713,61 @@ def obtener_capital_diario():
 
 
 # ── Resúmenes básicos ────────────────────────────────────────
+def resumen_ponderado(tabla: str, desde_fecha: str = None, hasta_fecha: str = None) -> dict:
+    """
+    16/09 — Fórmula CORRECTA documentada en v16 (encontrada en
+    conocimiento del proyecto): pondera cada operación por el capital
+    REAL que usó, no suma los % a lo bruto. La suma simple infla el
+    resultado ~20x en Bot Cripto (cada operación usa solo 5% del
+    capital, pero sumaba su % completo como si hubiera usado el 100%).
+    Sirve para las 4 tablas: senales (real) y las 3 simulaciones —
+    todas tienen capital_asignado calculado con el mismo criterio (5%
+    del capital de ese día), así que son comparables entre sí.
+    """
+    conn = _conn()
+    cur = conn.cursor()
+    campo_bu = "bu_order_id IS NOT NULL AND " if tabla == "senales" else ""
+    query = f"SELECT resultado_pct, capital_asignado FROM {tabla} WHERE {campo_bu}cerrado = 1 AND resultado_pct IS NOT NULL"
+    params = []
+    if desde_fecha:
+        query += " AND fecha >= ?"
+        params.append(desde_fecha)
+    if hasta_fecha:
+        query += " AND fecha <= ?"
+        params.append(hasta_fecha)
+    cur.execute(query, tuple(params))
+    filas = cur.fetchall()
+    conn.close()
+
+    if not filas:
+        return {"n_cerradas": 0}
+
+    cap_hoy = obtener_capital_diario()
+    capital_total = cap_hoy["capital_dia"] if cap_hoy else None
+
+    ganancia_usd = 0.0
+    n_ganadoras = 0
+    resultados_pct = []
+    for resultado_pct, capital_asignado in filas:
+        resultados_pct.append(resultado_pct)
+        if resultado_pct > 0:
+            n_ganadoras += 1
+        cap_op = capital_asignado if capital_asignado else 0
+        ganancia_usd += (resultado_pct / 100) * cap_op
+
+    neto_ponderado_pct = round((ganancia_usd / capital_total) * 100, 2) if capital_total else None
+
+    return {
+        "n_cerradas": len(filas),
+        "n_ganadoras": n_ganadoras,
+        "n_perdedoras": len(filas) - n_ganadoras,
+        "win_rate_pct": round(n_ganadoras / len(filas) * 100, 1),
+        "resultado_neto_pct": round(sum(resultados_pct), 2),  # suma simple, se mantiene como referencia
+        "ganancia_usd": round(ganancia_usd, 2),
+        "neto_ponderado_pct": neto_ponderado_pct,  # el número correcto
+    }
+
+
 def resumen_completo(desde_fecha: str = None, hasta_fecha: str = None, por_cierre: bool = False) -> dict:
     """
     07/09 — Informe completo para análisis, en un solo comando. Incluye
