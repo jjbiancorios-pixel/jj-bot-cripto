@@ -138,6 +138,51 @@ def _cmd_probar_pionex(args: list) -> str:
         return f"⚠️ Error al conectar con Pionex: {e}"
 
 
+def _cmd_diagnostico_apertura() -> str:
+    """
+    16/09 — Igual que en PAXG: prueba el flujo REAL de apertura
+    (capital del día real, datos reales de BTC) contra checkParams de
+    Pionex — que NUNCA abre nada, solo valida. Confirma si el flujo de
+    apertura sigue funcionando sin arriesgar capital, aunque el bot
+    esté pausado.
+    """
+    try:
+        import main
+        import gestion_riesgo
+        import pionex_api
+
+        capital = gestion_riesgo.calcular_capital_por_operacion()
+        if capital is None:
+            return "⚠️ No se pudo calcular el capital del día todavía (probar de nuevo en un rato)."
+
+        df1h = main.get_velas("BTCUSDT", "1h", 100)
+        if df1h is None:
+            return "⚠️ No se pudo obtener velas de BTC para el diagnóstico."
+        precio = float(df1h["close"].iloc[-1])
+        atr_abs = main.calc_atr(df1h)
+        atr_pct = atr_abs / precio * 100 if precio > 0 else 1.0
+        adx_info = main.calc_adx(df1h)
+        adx = adx_info["adx"]
+
+        grid = main.calcular_grid(precio, atr_pct, adx)
+        resultado = pionex_api.validar_parametros_grilla(
+            "BTC", grid["top"], grid["bottom"], grid["grillas"],
+            capital, gestion_riesgo.LEVERAGE_FIJO, "long"
+        )
+        ok = resultado.get("result") is True or resultado.get("code") == 0 or resultado.get("data")
+
+        return (
+            "🩺 <b>Diagnóstico de apertura</b> (NUNCA abre nada, solo valida — usa BTC como referencia)\n\n"
+            f"Capital real de hoy: <b>USD {capital:.2f}</b>\n"
+            f"Precio BTC: {precio:.2f} | ATR: {atr_pct:.2f}% | ADX: {adx:.1f}\n"
+            f"Rango: {grid['rango_pct']}% | Grillas: {grid['grillas']}\n\n"
+            f"{'✅ Pionex ACEPTARÍA este monto' if ok else '❌ Pionex RECHAZARÍA esto'}\n"
+            f"<code>{str(resultado)[:350]}</code>"
+        )
+    except Exception as e:
+        return f"⚠️ Error en el diagnóstico: {e}"
+
+
 def _cmd_backup_db() -> str:
     if not os.path.exists(db.DB_PATH):
         return "⚠️ No encontré la base de datos en el servidor."
@@ -380,6 +425,8 @@ def procesar_comando(texto: str) -> str:
         return _cmd_reanudar_todo()
     elif cmd == "/probar_pionex":
         return _cmd_probar_pionex(args)
+    elif cmd == "/diagnostico_apertura":
+        return _cmd_diagnostico_apertura()
     elif cmd == "/backup_db":
         return _cmd_backup_db()
     elif cmd == "/gates":
