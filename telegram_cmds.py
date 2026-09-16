@@ -379,6 +379,14 @@ def _cmd_comparar(args: list) -> str:
         desde_fecha = args[0]
         if len(args) >= 2:
             hasta_fecha = args[1]
+    elif args and args[0].lower() == "todo" and len(args) >= 2:
+        # 16/09: si escriben "todo" seguido de fechas (por costumbre,
+        # no hace falta la palabra), las fechas igual se usan en vez
+        # de ignorarlas — antes esto daba SIEMPRE el historial
+        # completo sin importar qué fechas pusieran después.
+        desde_fecha = args[1]
+        if len(args) >= 3:
+            hasta_fecha = args[2]
     if desde_fecha is None:
         etiqueta = "TODO EL HISTORIAL"
     elif hasta_fecha:
