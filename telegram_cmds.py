@@ -374,10 +374,17 @@ def _cmd_comparar(args: list) -> str:
     la suma simple inflaba el resultado ~20x (cada operación usa solo
     5% del capital real, pero sumaba su % completo).
     """
-    desde_fecha = None
+    desde_fecha, hasta_fecha = None, None
     if args and args[0].lower() != "todo":
         desde_fecha = args[0]
-    etiqueta = "TODO EL HISTORIAL" if desde_fecha is None else desde_fecha
+        if len(args) >= 2:
+            hasta_fecha = args[1]
+    if desde_fecha is None:
+        etiqueta = "TODO EL HISTORIAL"
+    elif hasta_fecha:
+        etiqueta = f"{desde_fecha} a {hasta_fecha}"
+    else:
+        etiqueta = desde_fecha
 
     def _fmt(r):
         if r.get("n_cerradas", 0) == 0:
@@ -386,10 +393,10 @@ def _cmd_comparar(args: list) -> str:
         ponderado_txt = f"{ponderado:+.2f}%" if ponderado is not None else "s/d (falta capital de hoy)"
         return f"n={r['n_cerradas']} | win rate {r['win_rate_pct']}% | <b>neto real: {ponderado_txt}</b> (suma simple: {r['resultado_neto_pct']:+.2f}%)"
 
-    r_real = db.resumen_ponderado("senales", desde_fecha)
-    r_sim = db.resumen_ponderado("simulaciones", desde_fecha)
-    r_dir = db.resumen_ponderado("simulaciones_directivas", desde_fecha)
-    r_combo = db.resumen_ponderado("simulaciones_combo", desde_fecha)
+    r_real = db.resumen_ponderado("senales", desde_fecha, hasta_fecha)
+    r_sim = db.resumen_ponderado("simulaciones", desde_fecha, hasta_fecha)
+    r_dir = db.resumen_ponderado("simulaciones_directivas", desde_fecha, hasta_fecha)
+    r_combo = db.resumen_ponderado("simulaciones_combo", desde_fecha, hasta_fecha)
 
     return (f"📊 <b>Comparación de estrategias — {etiqueta}</b>\n\n"
             f"🔴 Real (fix28): {_fmt(r_real)}\n\n"
