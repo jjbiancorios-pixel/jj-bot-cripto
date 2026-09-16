@@ -277,6 +277,40 @@ def _crear_tabla_simulaciones(cur):
         except Exception:
             pass  # ya existe
 
+    # 16/09 FIX: las simulaciones creadas ANTES de agregar la columna
+    # de arriba quedaron con capital_asignado=NULL — la fórmula
+    # ponderada las trataba como si hubieran usado $0 de capital,
+    # dando 0.00% en vez del resultado real (bug real detectado por
+    # Juanjo comparando "neto real" vs. la suma simple). Backfill
+    # retroactivo: usa el capital_dia real de CADA fecha (tabla
+    # capital_diario) × 5%, el mismo cálculo que se usa para las
+    # nuevas.
+    for tabla in ("simulaciones", "simulaciones_directivas", "simulaciones_combo"):
+        cur.execute(f"""
+            UPDATE {tabla}
+            SET capital_asignado = (
+                SELECT ROUND(capital_diario.capital_dia * 0.05, 2)
+                FROM capital_diario
+                WHERE capital_diario.fecha = {tabla}.fecha
+            )
+            WHERE capital_asignado IS NULL
+              AND EXISTS (SELECT 1 FROM capital_diario WHERE capital_diario.fecha = {tabla}.fecha)
+        """)
+        # Respaldo: si no hay registro EXACTO de esa fecha (ej. el bot
+        # estuvo caído justo a las 00:01), usa el capital_diario más
+        # cercano ANTERIOR disponible — mejor estimación que dejar 0.
+        cur.execute(f"""
+            UPDATE {tabla}
+            SET capital_asignado = (
+                SELECT ROUND(capital_diario.capital_dia * 0.05, 2)
+                FROM capital_diario
+                WHERE capital_diario.fecha <= {tabla}.fecha
+                ORDER BY capital_diario.fecha DESC
+                LIMIT 1
+            )
+            WHERE capital_asignado IS NULL
+        """)
+
 
 def _capital_asignado_estimado() -> float:
     """5% del capital de hoy (mismo % que usaría una posición real) — para que las simulaciones sean comparables con capital real."""
