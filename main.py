@@ -658,6 +658,16 @@ def ciclo_seleccion():
             db.crear_simulacion_combo(par, candidato["direccion"], candidato.get("score"),
                                        candidato.get("adx"), candidato.get("atr_pct"), candidato["precio"])
 
+        # 16/09 — 5ta simulación: "Real (fix28) fiel" — réplica exacta
+        # de la estrategia real, misma entrada y misma salida (con las
+        # 2 protecciones extra), sin capital real. A pedido de Juanjo:
+        # recopilar qué HUBIERA pasado si el bot siguiera activo,
+        # mientras está pausado, para comparar después.
+        if not db.par_tiene_simulacion_fix28_fiel_abierta(par):
+            db.crear_simulacion_fix28_fiel(par, candidato["direccion"], candidato.get("score"),
+                                            candidato.get("adx"), candidato.get("atr_pct"), candidato["precio"],
+                                            candidato.get("rango_bajo"), candidato.get("rango_alto"))
+
         if pausado:
             continue  # ya quedó registrado en gates_log, no abre nada real
         # 10/09: modo cauto (BTC cambió de tendencia hace poco) — límite
@@ -823,6 +833,24 @@ def chequeo_rapido_riesgo():
                     db.cerrar_simulacion_combo(sim["id"], resultado_actual_sim, decision_sim["motivo"])
                 else:
                     db.actualizar_pico_simulacion_combo(sim["id"], decision_sim["pico_nuevo"])
+
+            # ── 16/09: chequeo de la 5ta simulación ("Real (fix28) fiel") ──
+            for sim in db.simulaciones_fix28_fiel_abiertas():
+                precio_actual_sim = get_precio(sim["par"])
+                if precio_actual_sim is None:
+                    continue
+                cambio_precio_pct = (precio_actual_sim - sim["precio_entrada"]) / sim["precio_entrada"] * 100
+                signo = 1 if sim["direccion"] == "LARGO" else -1
+                resultado_actual_sim = cambio_precio_pct * signo * gestion_riesgo.LEVERAGE_FIJO
+                decision_sim = gestion_riesgo.evaluar_cierre_fix28_fiel(
+                    sim["direccion"], sim["atr_pct"], sim["pico_maximo_pct"], resultado_actual_sim,
+                    precio_actual_sim, sim.get("rango_bajo"), sim.get("rango_alto"),
+                    sim.get("fuera_rango_desde"), btc_cache["estado"]
+                )
+                if decision_sim["cerrar"]:
+                    db.cerrar_simulacion_fix28_fiel(sim["id"], resultado_actual_sim, decision_sim["motivo"])
+                else:
+                    db.actualizar_simulacion_fix28_fiel(sim["id"], decision_sim["pico_nuevo"], decision_sim["fuera_rango_desde_nuevo"])
         except Exception as e:
             print(f"⚠️ chequeo_rapido_riesgo: {e}", flush=True)
         time.sleep(2)

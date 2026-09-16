@@ -218,6 +218,75 @@ def evaluar_cierre_directivas(direccion: str, pico_maximo_pct: float, resultado_
     return {"cerrar": False, "motivo": None, "pico_nuevo": pico_actual}
 
 
+def evaluar_cierre_fix28_fiel(direccion: str, atr_pct: float, pico_maximo_pct: float, resultado_actual_pct: float,
+                               precio_actual: float = None, rango_bajo: float = None, rango_alto: float = None,
+                               fuera_rango_desde: str = None, btc_estado: str = None) -> dict:
+    """
+    16/09 — Réplica FIEL 1 a 1 de evaluar_cierre() (la función real de
+    fix28), pero SIN escribir en la base — para la simulación "Real
+    (fix28) fiel", a pedido de Juanjo: quiere ver en la comparación
+    cómo rendiría el bot EXACTAMENTE como está configurado ahora
+    (incluidas las 2 protecciones extra: fuera de rango y BTC en
+    contra), sin arriesgar capital mientras sigue pausado.
+
+    A diferencia de evaluar_cierre_simulado() (la "Simulación
+    original", que a propósito NO tiene estas 2 protecciones), esta sí
+    las incluye — es la réplica más fiel posible.
+
+    Devuelve además "pico_nuevo" y "fuera_rango_desde_nuevo" para que
+    el llamador los persista él mismo (acá no hay senal_id real).
+    """
+    if resultado_actual_pct <= SL_FIJO_PCT:
+        return {"cerrar": True, "motivo": "stop_loss", "pico_nuevo": pico_maximo_pct, "fuera_rango_desde_nuevo": fuera_rango_desde}
+
+    pico_actual = max(pico_maximo_pct or 0, resultado_actual_pct)
+    nombre_tramo, retroceso_pct = calcular_tramo(pico_actual, atr_pct)
+    umbral_breakeven, _, _ = _umbrales_por_atr(atr_pct)
+    breakeven_activo = pico_actual >= umbral_breakeven
+
+    if not breakeven_activo:
+        return {"cerrar": False, "motivo": None, "pico_nuevo": pico_actual, "fuera_rango_desde_nuevo": None}
+
+    fuera_de_rango = False
+    if precio_actual is not None and rango_bajo and rango_alto:
+        fuera_de_rango = precio_actual < rango_bajo or precio_actual > rango_alto
+
+    if fuera_de_rango and not fuera_rango_desde:
+        fuera_rango_desde = datetime.now(TZ_ARG).isoformat()
+    elif not fuera_de_rango and fuera_rango_desde:
+        fuera_rango_desde = None
+
+    if fuera_rango_desde:
+        try:
+            desde_dt = datetime.fromisoformat(fuera_rango_desde)
+            horas_fuera = (datetime.now(TZ_ARG) - desde_dt).total_seconds() / 3600
+            if horas_fuera >= HORAS_MAX_FUERA_DE_RANGO:
+                return {"cerrar": True, "motivo": "fuera_rango_3hs", "pico_nuevo": pico_actual, "fuera_rango_desde_nuevo": fuera_rango_desde}
+        except Exception:
+            pass
+
+    btc_en_contra = bool(btc_estado) and (
+        (direccion == "LARGO" and btc_estado == "BAJISTA") or
+        (direccion == "CORTO" and btc_estado == "ALCISTA")
+    )
+    modo_cauto = fuera_de_rango or btc_en_contra
+
+    if retroceso_pct is None:
+        if resultado_actual_pct <= 0:
+            return {"cerrar": True, "motivo": "breakeven", "pico_nuevo": pico_actual, "fuera_rango_desde_nuevo": fuera_rango_desde}
+        return {"cerrar": False, "motivo": None, "pico_nuevo": pico_actual, "fuera_rango_desde_nuevo": fuera_rango_desde}
+
+    retroceso_efectivo = retroceso_pct / 2 if modo_cauto else retroceso_pct
+    piso_permitido = pico_actual * (1 - retroceso_efectivo)
+    if resultado_actual_pct <= piso_permitido:
+        motivo = "trailing_tp_cauto" if modo_cauto else "trailing_tp"
+        return {"cerrar": True, "motivo": motivo, "pico_nuevo": pico_actual, "fuera_rango_desde_nuevo": fuera_rango_desde}
+    if resultado_actual_pct <= 0:
+        return {"cerrar": True, "motivo": "breakeven", "pico_nuevo": pico_actual, "fuera_rango_desde_nuevo": fuera_rango_desde}
+
+    return {"cerrar": False, "motivo": None, "pico_nuevo": pico_actual, "fuera_rango_desde_nuevo": fuera_rango_desde}
+
+
 def hay_lugar_para_abrir() -> dict:
     """Chequea el tope de 6 posiciones simultáneas y el tope de 2 aperturas por ciclo de 15min."""
     abiertas = db.contar_posiciones_abiertas()

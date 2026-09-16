@@ -402,12 +402,14 @@ def _cmd_comparar(args: list) -> str:
         return f"n={r['n_cerradas']} | win rate {r['win_rate_pct']}% | <b>neto real: {ponderado_txt}</b> (suma simple: {r['resultado_neto_pct']:+.2f}%)"
 
     r_real = db.resumen_ponderado("senales", desde_fecha, hasta_fecha)
+    r_fiel = db.resumen_ponderado("simulaciones_fix28_fiel", desde_fecha, hasta_fecha)
     r_sim = db.resumen_ponderado("simulaciones", desde_fecha, hasta_fecha)
     r_dir = db.resumen_ponderado("simulaciones_directivas", desde_fecha, hasta_fecha)
     r_combo = db.resumen_ponderado("simulaciones_combo", desde_fecha, hasta_fecha)
 
     return (f"📊 <b>Comparación de estrategias — {etiqueta}</b>\n\n"
-            f"🔴 Real (fix28): {_fmt(r_real)}\n\n"
+            f"🔴 Real, con capital de verdad (fix28): {_fmt(r_real)}\n\n"
+            f"👻 Real (fix28) fiel — qué hubiera pasado sin pausa: {_fmt(r_fiel)}\n\n"
             f"🧪 Simulación original: {_fmt(r_sim)}\n\n"
             f"📐 Directivas: {_fmt(r_dir)}\n\n"
             f"🔀 Combo (entrada Directivas + salida original): {_fmt(r_combo)}")

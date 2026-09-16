@@ -264,6 +264,35 @@ def _crear_tabla_simulaciones(cur):
             creado TEXT NOT NULL
         )
     """)
+    # 16/09 — simulación "Real (fix28) fiel": réplica exacta de la
+    # estrategia real (misma entrada Y misma salida, con las 2
+    # protecciones extra incluidas) sin capital real — a pedido de
+    # Juanjo, para ver los datos "del bot tal cual está predeterminado
+    # ahora" en la comparación, aunque esté pausado.
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS simulaciones_fix28_fiel (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            par TEXT NOT NULL,
+            direccion TEXT NOT NULL,
+            score INTEGER,
+            adx REAL,
+            atr_pct REAL,
+            precio_entrada REAL,
+            rango_bajo REAL,
+            rango_alto REAL,
+            pico_maximo_pct REAL DEFAULT 0,
+            fuera_rango_desde TEXT,
+            capital_asignado REAL,
+            fecha TEXT NOT NULL,
+            hora TEXT NOT NULL,
+            cerrado INTEGER DEFAULT 0,
+            resultado_pct REAL,
+            motivo_cierre TEXT,
+            fecha_cierre TEXT,
+            hora_cierre TEXT,
+            creado TEXT NOT NULL
+        )
+    """)
 
     # 16/09: capital_asignado para calcular el resultado PONDERADO (no
     # la suma simple) — misma fórmula documentada en v16: cada
@@ -271,7 +300,7 @@ def _crear_tabla_simulaciones(cur):
     # el total se divide por el capital total de la cartera. Las
     # simulaciones usan el mismo 5% que usaría la real, para que la
     # comparación sea de manzanas con manzanas.
-    for tabla in ("simulaciones", "simulaciones_directivas", "simulaciones_combo"):
+    for tabla in ("simulaciones", "simulaciones_directivas", "simulaciones_combo", "simulaciones_fix28_fiel"):
         try:
             cur.execute(f"ALTER TABLE {tabla} ADD COLUMN capital_asignado REAL")
         except Exception:
@@ -285,7 +314,7 @@ def _crear_tabla_simulaciones(cur):
     # retroactivo: usa el capital_dia real de CADA fecha (tabla
     # capital_diario) × 5%, el mismo cálculo que se usa para las
     # nuevas.
-    for tabla in ("simulaciones", "simulaciones_directivas", "simulaciones_combo"):
+    for tabla in ("simulaciones", "simulaciones_directivas", "simulaciones_combo", "simulaciones_fix28_fiel"):
         cur.execute(f"""
             UPDATE {tabla}
             SET capital_asignado = (
@@ -474,6 +503,61 @@ def cerrar_simulacion_combo(sim_id: int, resultado_pct: float, motivo: str):
     ahora = datetime.now(TZ_ARG)
     cur.execute("""
         UPDATE simulaciones_combo SET cerrado = 1, resultado_pct = ?, motivo_cierre = ?, fecha_cierre = ?, hora_cierre = ?
+        WHERE id = ?
+    """, (resultado_pct, motivo, ahora.strftime("%Y%m%d"), ahora.strftime("%H:%M"), sim_id))
+    conn.commit()
+    conn.close()
+
+
+def par_tiene_simulacion_fix28_fiel_abierta(par: str) -> bool:
+    conn = _conn()
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM simulaciones_fix28_fiel WHERE cerrado = 0 AND par = ?", (par,))
+    n = cur.fetchone()[0]
+    conn.close()
+    return n > 0
+
+
+def crear_simulacion_fix28_fiel(par, direccion, score, adx, atr_pct, precio_entrada, rango_bajo, rango_alto) -> int:
+    conn = _conn()
+    cur = conn.cursor()
+    ahora = datetime.now(TZ_ARG)
+    capital_asignado = _capital_asignado_estimado()
+    cur.execute("""
+        INSERT INTO simulaciones_fix28_fiel (par, direccion, score, adx, atr_pct, precio_entrada, rango_bajo, rango_alto, capital_asignado, fecha, hora, creado)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+    """, (par, direccion, score, adx, atr_pct, precio_entrada, rango_bajo, rango_alto, capital_asignado,
+          ahora.strftime("%Y%m%d"), ahora.strftime("%H:%M"), ahora.isoformat()))
+    conn.commit()
+    sim_id = cur.lastrowid
+    conn.close()
+    return sim_id
+
+
+def simulaciones_fix28_fiel_abiertas() -> list:
+    conn = _conn()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM simulaciones_fix28_fiel WHERE cerrado = 0")
+    rows = [dict(r) for r in cur.fetchall()]
+    conn.close()
+    return rows
+
+
+def actualizar_simulacion_fix28_fiel(sim_id: int, pico_nuevo: float, fuera_rango_desde_nuevo):
+    conn = _conn()
+    cur = conn.cursor()
+    cur.execute("UPDATE simulaciones_fix28_fiel SET pico_maximo_pct = ?, fuera_rango_desde = ? WHERE id = ?",
+                (pico_nuevo, fuera_rango_desde_nuevo, sim_id))
+    conn.commit()
+    conn.close()
+
+
+def cerrar_simulacion_fix28_fiel(sim_id: int, resultado_pct: float, motivo: str):
+    conn = _conn()
+    cur = conn.cursor()
+    ahora = datetime.now(TZ_ARG)
+    cur.execute("""
+        UPDATE simulaciones_fix28_fiel SET cerrado = 1, resultado_pct = ?, motivo_cierre = ?, fecha_cierre = ?, hora_cierre = ?
         WHERE id = ?
     """, (resultado_pct, motivo, ahora.strftime("%Y%m%d"), ahora.strftime("%H:%M"), sim_id))
     conn.commit()
