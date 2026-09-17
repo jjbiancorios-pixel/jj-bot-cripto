@@ -862,6 +862,18 @@ def resumen_ponderado(tabla: str, desde_fecha: str = None, hasta_fecha: str = No
 
     cap_hoy = obtener_capital_diario()
     capital_total = cap_hoy["capital_dia"] if cap_hoy else None
+    if capital_total is None:
+        # 17/09 FIX: si el recálculo de hoy no corrió todavía (ej.
+        # siempre hubo una posición abierta justo a las 00:01, que
+        # pospone el recálculo indefinidamente mientras el bot está
+        # activo) — usar el capital_dia MÁS RECIENTE disponible, en
+        # vez de mostrar "s/d" cada vez que esto pase.
+        conn2 = _conn()
+        cur2 = conn2.cursor()
+        cur2.execute("SELECT capital_dia FROM capital_diario ORDER BY fecha DESC LIMIT 1")
+        row2 = cur2.fetchone()
+        conn2.close()
+        capital_total = row2[0] if row2 else None
 
     ganancia_usd = 0.0
     n_ganadoras = 0
