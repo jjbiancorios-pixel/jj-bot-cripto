@@ -59,6 +59,23 @@ PARES = [
     "XAIUSDT", "ZETAUSDT", "ZRXUSDT",
     "TONUSDT", "EIGENUSDT", "MOVEUSDT", "VIRTUALUSDT",
     "PENGUUSDT", "MOCAUSDT", "SCRUSDT",
+    # 17/09 — Directiva V5.0: ampliación de 77 a 120 pares (filtro de
+    # volumen/spread hace la selección real en cada ciclo). AVISO
+    # HONESTO: no pude confirmar 1 por 1 que cada uno esté disponible
+    # específicamente en Pionex Futures Grid (mismo tipo de problema
+    # que tuvimos con 1000PEPEUSDT) — evité a propósito otros tokens
+    # con prefijo "1000x" por la misma razón, pero el resto conviene
+    # vigilarlo los primeros días por si Pionex rechaza alguno con
+    # "invalid symbol".
+    "BCHUSDT", "FILUSDT", "APEUSDT", "EOSUSDT", "THETAUSDT",
+    "KAVAUSDT", "ZILUSDT", "ENJUSDT", "1INCHUSDT", "COMPUSDT",
+    "SNXUSDT", "YFIUSDT", "SUSHIUSDT", "BATUSDT", "ZECUSDT",
+    "DASHUSDT", "QTUMUSDT", "ONTUSDT", "ICXUSDT", "KNCUSDT",
+    "STORJUSDT", "CELOUSDT", "ANKRUSDT", "CTSIUSDT", "RSRUSDT",
+    "OCEANUSDT", "BANDUSDT", "RLCUSDT", "COTIUSDT", "DYDXUSDT",
+    "GMXUSDT", "WOOUSDT", "HOOKUSDT", "CFXUSDT", "MAGICUSDT",
+    "HFTUSDT", "RDNTUSDT", "EDUUSDT", "IDUSDT", "CYBERUSDT",
+    "ARUSDT", "ACHUSDT", "TRBUSDT",
 ]
 
 # Pares "majors" — umbral de ADX más bajo (23 en vez de 28), porque
@@ -371,6 +388,122 @@ def actualizar_modo_cauto_btc(btc: dict):
 
 
 # ── Análisis de un par: 3 gates + score ─────────────────────
+def pasa_filtro_universo(par: str) -> bool:
+    """
+    17/09 — Directiva V5.0: filtro previo, ANTES de evaluar cualquier
+    gate. Descarta si volumen 24h < 10M USDT o spread > 0,08%. Sin
+    dato confiable de alguno de los 2, descarta por seguridad (mejor
+    perderse una señal que operar en algo demasiado ilíquido).
+    """
+    try:
+        r = requests.get(f"https://data-api.binance.vision/api/v3/ticker/24hr?symbol={par}", timeout=6)
+        data = r.json()
+        volumen_24h_usdt = float(data.get("quoteVolume", 0))
+        if volumen_24h_usdt < gestion_riesgo.VOLUMEN_24H_MINIMO_USDT:
+            return False
+    except Exception:
+        return False
+
+    try:
+        r2 = requests.get(f"https://data-api.binance.vision/api/v3/ticker/bookTicker?symbol={par}", timeout=6)
+        data2 = r2.json()
+        bid = float(data2.get("bidPrice", 0))
+        ask = float(data2.get("askPrice", 0))
+        if bid <= 0:
+            return False
+        spread_pct = (ask - bid) / bid * 100
+        if spread_pct > gestion_riesgo.SPREAD_MAXIMO_PCT:
+            return False
+    except Exception:
+        return False
+
+    return True
+
+
+def analizar_par_v5(par: str, btc: dict):
+    """
+    17/09 — Directiva V5.0 (AHORA LA PRINCIPAL): reemplaza por completo
+    el score/momentum antiguo. Gates que se MANTIENEN: EMA20 4h,
+    persistencia (3 velas, 1h), funding rate. Gate NUEVO que reemplaza
+    ADX+DI+score: ADX(1h)≤30 y RSI(15m)<45 para LARGO; ADX(1h)≤35 y
+    RSI(15m)>55 para CORTO — sin piso mínimo de ADX (tal cual lo pidió
+    Juanjo, a diferencia del diseño anterior que sí tenía piso).
+    """
+    if not pasa_filtro_universo(par):
+        return None
+
+    df15 = get_velas(par, "15m", 100)
+    df1h = get_velas(par, "1h", 100)
+    df4h = get_velas(par, "4h", 100)
+    if df15 is None or df1h is None or df4h is None:
+        return None
+
+    precio = df15["close"].iloc[-1]
+
+    ema9_1h = calc_ema(df1h["close"], 9)
+    ema21_1h = calc_ema(df1h["close"], 21)
+    diferencia_ema_pct = abs(ema9_1h - ema21_1h) / ema21_1h * 100 if ema21_1h > 0 else 0
+    if diferencia_ema_pct < 0.05:
+        return None
+    direccion = "LARGO" if ema9_1h > ema21_1h else "CORTO"
+
+    # Persistencia (se mantiene, sin cambios respecto al diseño anterior)
+    ema9_serie = df1h["close"].ewm(span=9).mean()
+    ema21_serie = df1h["close"].ewm(span=21).mean()
+    diff_serie = (ema9_serie - ema21_serie).iloc[-3:]
+    signo_actual = 1 if direccion == "LARGO" else -1
+    persistio = bool((np.sign(diff_serie) == signo_actual).all())
+    if not persistio:
+        db.guardar_gates_log(par, "SIN_PERSISTENCIA", 0, 0, False, False, False, 0, 0, False, None, None, None)
+        return None
+
+    # EMA20 4h (se mantiene)
+    ema20_4h = calc_ema(df4h["close"], 20)
+    paso_ema4h = (precio > ema20_4h) if direccion == "LARGO" else (precio < ema20_4h)
+    if not paso_ema4h:
+        db.guardar_gates_log(par, direccion, 0, 0, True, False, False, 0, 0, False, None, None, None)
+        return None
+
+    # Funding rate (se mantiene)
+    funding = get_funding_rate(par)
+    paso_funding = True
+    if funding is not None:
+        if direccion == "LARGO" and funding > 0.05:
+            paso_funding = False
+        elif direccion == "CORTO" and funding < -0.05:
+            paso_funding = False
+    if not paso_funding:
+        db.guardar_gates_log(par, direccion, 0, 0, True, True, False, 0, 0, False, None, None, None)
+        return None
+
+    # ── Gate NUEVO de V5.0: ADX(1h) + RSI(15m), reemplaza ADX+DI+score ──
+    adx_info = calc_adx(df1h)
+    adx = adx_info["adx"]
+    rsi_15m = calc_rsi(df15["close"])
+    atr_abs = calc_atr(df15)
+    atr_pct = atr_abs / precio * 100 if precio > 0 else 0
+
+    if direccion == "LARGO":
+        paso_v5 = adx <= gestion_riesgo.ADX_TECHO_V5_LARGO and rsi_15m < gestion_riesgo.RSI_V5_LARGO_MAX
+    else:
+        paso_v5 = adx <= gestion_riesgo.ADX_TECHO_V5_CORTO and rsi_15m > gestion_riesgo.RSI_V5_CORTO_MIN
+
+    db.guardar_gates_log(par, direccion, adx, 0, True, True, True, 10 if paso_v5 else 0, 0, paso_v5, atr_pct, rsi_15m, None)
+
+    if not paso_v5:
+        return None
+
+    grid = calcular_grid(precio, atr_pct, adx)
+
+    return {
+        "par": par, "direccion": direccion, "precio": precio,
+        "adx": round(adx, 2), "rsi": round(rsi_15m, 2), "atr_pct": round(atr_pct, 3),
+        "score": 10, "razones": [f"V5.0: ADX(1h)={round(adx,1)} RSI(15m)={round(rsi_15m,1)}"],
+        "rango_pct": grid["rango_pct"], "rango_bajo": round(grid["bottom"], 6),
+        "rango_alto": round(grid["top"], 6), "grillas": grid["grillas"],
+    }
+
+
 def analizar_par(par: str, btc: dict):
     df15 = get_velas(par, "15m", 100)
     df1h = get_velas(par, "1h", 100)
@@ -668,17 +801,31 @@ def ciclo_seleccion():
                                             candidato.get("adx"), candidato.get("atr_pct"), candidato["precio"],
                                             candidato.get("rango_bajo"), candidato.get("rango_alto"))
 
-        if pausado:
-            continue  # ya quedó registrado en gates_log, no abre nada real
-        # 10/09: modo cauto (BTC cambió de tendencia hace poco) — límite
-        # de 3-de-6 posiciones en la misma dirección, para no quedar
-        # todas concentradas del mismo lado justo cuando BTC gira.
-        if modo_cauto_activo and db.contar_posiciones_por_direccion(candidato["direccion"]) >= 3:
-            continue
-        lugar = gestion_riesgo.hay_lugar_para_abrir()
-        if not lugar["hay_lugar"]:
-            break
-        abrir_posicion_real(candidato)
+        # 17/09 — Directiva V5.0: AHORA LA PRINCIPAL, reemplaza a fix28
+        # en el capital real. Se evalúa por separado (gates propios:
+        # filtro de universo + ADX/RSI nuevos, EMA4h/persistencia/
+        # funding se mantienen) — candidato_fix28 (arriba) queda
+        # SOLO para sus 4 simulaciones de comparación, ya no abre
+        # posiciones reales.
+        try:
+            candidato_v5 = analizar_par_v5(par, btc)
+        except Exception as e:
+            print(f"Error analizando {par} (V5.0): {e}")
+            candidato_v5 = None
+
+        if candidato_v5:
+            # "V5.0 fiel" — SIEMPRE recopila, sin importar la pausa
+            if not db.par_tiene_simulacion_v5_fiel_abierta(par):
+                db.crear_simulacion_v5_fiel(par, candidato_v5["direccion"], candidato_v5.get("score"),
+                                             candidato_v5.get("adx"), candidato_v5.get("atr_pct"), candidato_v5["precio"])
+
+            if not pausado and not db.par_tiene_posicion_abierta(par):
+                if not (modo_cauto_activo and db.contar_posiciones_por_direccion(candidato_v5["direccion"]) >= 3):
+                    lugar = gestion_riesgo.hay_lugar_para_abrir()
+                    if lugar["hay_lugar"]:
+                        abrir_posicion_real(candidato_v5)
+
+        continue  # el resto del loop (apertura real vieja con fix28) queda deshabilitado, ver arriba
 
 
 # ── Chequeo rápido de SL/trailing — DIRECTO a Pionex, cada 2seg ────
@@ -730,7 +877,14 @@ def chequeo_rapido_riesgo():
 
                 db.actualizar_mae_mfe(senal["id"], resultado_pct)
 
-                decision = gestion_riesgo.evaluar_cierre(senal, resultado_pct, precio_actual, btc_cache["estado"])
+                # 17/09 — Directiva V5.0: las posiciones REALES ahora
+                # usan la salida de V5.0 (SL -4,5% + trailing 1 tramo),
+                # no la de fix28 (que tenía fuera-de-rango/BTC-en-contra
+                # — V5.0 no las mantiene, según la directiva).
+                pico_actual_senal = senal.get("pico_maximo_pct", 0) or 0
+                decision_v5 = gestion_riesgo.evaluar_cierre_v5(senal["direccion"], pico_actual_senal, resultado_pct)
+                db.actualizar_pico_y_tramo(senal["id"], decision_v5["pico_nuevo"], "unico", decision_v5["pico_nuevo"] >= gestion_riesgo.PICO_ACTIVACION_V5_PCT)
+                decision = decision_v5
                 if decision["cerrar"]:
                     cierre = pionex_api.cerrar_grilla_futuros(senal["bu_order_id"], nota=decision["motivo"])
                     if not cierre["ok"]:
@@ -851,6 +1005,20 @@ def chequeo_rapido_riesgo():
                     db.cerrar_simulacion_fix28_fiel(sim["id"], resultado_actual_sim, decision_sim["motivo"])
                 else:
                     db.actualizar_simulacion_fix28_fiel(sim["id"], decision_sim["pico_nuevo"], decision_sim["fuera_rango_desde_nuevo"])
+
+            # ── 17/09: chequeo de "V5.0 fiel" (la NUEVA principal, sin capital real) ──
+            for sim in db.simulaciones_v5_fiel_abiertas():
+                precio_actual_sim = get_precio(sim["par"])
+                if precio_actual_sim is None:
+                    continue
+                cambio_precio_pct = (precio_actual_sim - sim["precio_entrada"]) / sim["precio_entrada"] * 100
+                signo = 1 if sim["direccion"] == "LARGO" else -1
+                resultado_actual_sim = cambio_precio_pct * signo * gestion_riesgo.LEVERAGE_FIJO
+                decision_sim = gestion_riesgo.evaluar_cierre_v5(sim["direccion"], sim["pico_maximo_pct"], resultado_actual_sim)
+                if decision_sim["cerrar"]:
+                    db.cerrar_simulacion_v5_fiel(sim["id"], resultado_actual_sim, decision_sim["motivo"])
+                else:
+                    db.actualizar_pico_simulacion_v5_fiel(sim["id"], decision_sim["pico_nuevo"])
         except Exception as e:
             print(f"⚠️ chequeo_rapido_riesgo: {e}", flush=True)
         time.sleep(2)

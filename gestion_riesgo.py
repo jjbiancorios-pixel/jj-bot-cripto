@@ -218,6 +218,46 @@ def evaluar_cierre_directivas(direccion: str, pico_maximo_pct: float, resultado_
     return {"cerrar": False, "motivo": None, "pico_nuevo": pico_actual}
 
 
+# ── 17/09 — Directiva V5.0: nueva PRINCIPAL, reemplaza a fix28 en el capital real ──
+VOLUMEN_24H_MINIMO_USDT = 10_000_000
+SPREAD_MAXIMO_PCT = 0.08
+
+ADX_TECHO_V5_LARGO = 30
+ADX_TECHO_V5_CORTO = 35
+RSI_V5_LARGO_MAX = 45   # LARGO: RSI(15m) < 45 — "comprar el retroceso"
+RSI_V5_CORTO_MIN = 55   # CORTO: RSI(15m) > 55 — "vender el agotamiento"
+
+SL_V5_PCT = -4.5
+PICO_ACTIVACION_V5_PCT = 2.2
+RETROCESO_V5_PCT = 10  # fijo, un solo tramo
+
+
+def evaluar_cierre_v5(direccion: str, pico_maximo_pct: float, resultado_actual_pct: float) -> dict:
+    """
+    17/09 — Directiva V5.0 (AHORA LA REAL, reemplaza a fix28): SL fijo
+    -4,5%, trailing de un solo tramo (activa en pico≥2,2%, retrocede
+    10% fijo). Misma estructura que evaluar_cierre_directivas (que
+    sigue existiendo aparte, sin tocar, como comparación), con
+    activación levemente distinta (2,2% vs 2,0%).
+
+    MISMO RIESGO YA SEÑALADO EN DIRECTIVAS: un SL de -4,5% cae en la
+    zona que nuestro propio backtest de 196 operaciones reales (13/09)
+    mostró como PEOR que -7,5% (por whipsaw) — la diferencia esta vez
+    es que V5.0 SÍ va a manejar capital real desde ahora, a pedido
+    explícito de Juanjo.
+    """
+    if resultado_actual_pct <= SL_V5_PCT:
+        return {"cerrar": True, "motivo": "stop_loss", "pico_nuevo": pico_maximo_pct}
+
+    pico_actual = max(pico_maximo_pct or 0, resultado_actual_pct)
+    if pico_actual >= PICO_ACTIVACION_V5_PCT:
+        piso_permitido = pico_actual * (1 - RETROCESO_V5_PCT / 100)
+        if resultado_actual_pct <= piso_permitido:
+            return {"cerrar": True, "motivo": "trailing_v5", "pico_nuevo": pico_actual}
+
+    return {"cerrar": False, "motivo": None, "pico_nuevo": pico_actual}
+
+
 def evaluar_cierre_fix28_fiel(direccion: str, atr_pct: float, pico_maximo_pct: float, resultado_actual_pct: float,
                                precio_actual: float = None, rango_bajo: float = None, rango_alto: float = None,
                                fuera_rango_desde: str = None, btc_estado: str = None) -> dict:
