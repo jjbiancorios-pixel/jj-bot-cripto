@@ -419,23 +419,30 @@ def _cmd_comparar(args: list) -> str:
 
 def _cmd_gates(args: list) -> str:
     if not args:
-        return "Uso: /gates PAR\nEj: /gates BTC"
+        return "Uso: /gates PAR [fix28|v5]\nEj: /gates BTC v5"
     par = args[0].upper().strip()
     if not par.endswith("USDT"):
         par += "USDT"
+    filtro_estrategia = None
+    if len(args) > 1 and args[1].lower() in ("fix28", "v5"):
+        filtro_estrategia = args[1].lower()
     import sqlite3
     conn = sqlite3.connect(db.DB_PATH)
     conn.row_factory = sqlite3.Row
     cur = conn.cursor()
-    cur.execute("SELECT * FROM gates_log WHERE par = ? ORDER BY id DESC LIMIT 10", (par,))
+    if filtro_estrategia:
+        cur.execute("SELECT * FROM gates_log WHERE par = ? AND estrategia = ? ORDER BY id DESC LIMIT 10", (par, filtro_estrategia))
+    else:
+        cur.execute("SELECT * FROM gates_log WHERE par = ? ORDER BY id DESC LIMIT 10", (par,))
     filas = [dict(r) for r in cur.fetchall()]
     conn.close()
     if not filas:
         return f"Sin registros de gates todavía para {par}."
-    lineas = [f"🔍 <b>Últimos chequeos — {par}</b>"]
+    lineas = [f"🔍 <b>Últimos chequeos — {par}</b>" + (f" ({filtro_estrategia})" if filtro_estrategia else "")]
     for f in filas:
         gates = f"ADX:{'✅' if f['paso_adx'] else '❌'} EMA4h:{'✅' if f['paso_ema4h'] else '❌'} Funding:{'✅' if f['paso_funding'] else '❌'}"
-        lineas.append(f"{f['fecha']} {f['hora']} | {gates} | score {f['score']} (momentum {f['score_momentum']}) | {'CALIFICÓ' if f['califico'] else 'no calificó'}")
+        etiqueta_estrategia = f['estrategia'] or "fix28"
+        lineas.append(f"{f['fecha']} {f['hora']} | [{etiqueta_estrategia}] {gates} | score {f['score']} (momentum {f['score_momentum']}) | {'CALIFICÓ' if f['califico'] else 'no calificó'}")
     return "\n".join(lineas)
 
 

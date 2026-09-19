@@ -454,14 +454,14 @@ def analizar_par_v5(par: str, btc: dict):
     signo_actual = 1 if direccion == "LARGO" else -1
     persistio = bool((np.sign(diff_serie) == signo_actual).all())
     if not persistio:
-        db.guardar_gates_log(par, "SIN_PERSISTENCIA", 0, 0, False, False, False, 0, 0, False, None, None, None)
+        db.guardar_gates_log(par, "SIN_PERSISTENCIA", 0, 0, False, False, False, 0, 0, False, None, None, None, estrategia="v5")
         return None
 
     # EMA20 4h (se mantiene)
     ema20_4h = calc_ema(df4h["close"], 20)
     paso_ema4h = (precio > ema20_4h) if direccion == "LARGO" else (precio < ema20_4h)
     if not paso_ema4h:
-        db.guardar_gates_log(par, direccion, 0, 0, True, False, False, 0, 0, False, None, None, None)
+        db.guardar_gates_log(par, direccion, 0, 0, True, False, False, 0, 0, False, None, None, None, estrategia="v5")
         return None
 
     # Funding rate (se mantiene)
@@ -473,7 +473,7 @@ def analizar_par_v5(par: str, btc: dict):
         elif direccion == "CORTO" and funding < -0.05:
             paso_funding = False
     if not paso_funding:
-        db.guardar_gates_log(par, direccion, 0, 0, True, True, False, 0, 0, False, None, None, None)
+        db.guardar_gates_log(par, direccion, 0, 0, True, True, False, 0, 0, False, None, None, None, estrategia="v5")
         return None
 
     # ── Gate NUEVO de V5.0: ADX(1h) + RSI(15m), reemplaza ADX+DI+score ──
@@ -488,7 +488,7 @@ def analizar_par_v5(par: str, btc: dict):
     else:
         paso_v5 = adx <= gestion_riesgo.ADX_TECHO_V5_CORTO and rsi_15m > gestion_riesgo.RSI_V5_CORTO_MIN
 
-    db.guardar_gates_log(par, direccion, adx, 0, True, True, True, 10 if paso_v5 else 0, 0, paso_v5, atr_pct, rsi_15m, None)
+    db.guardar_gates_log(par, direccion, adx, 0, True, True, True, 10 if paso_v5 else 0, 0, paso_v5, atr_pct, rsi_15m, None, estrategia="v5")
 
     if not paso_v5:
         return None

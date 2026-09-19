@@ -48,6 +48,7 @@ def _migrar_columnas_nuevas(cur):
         ("atr_pct", "REAL"),
         ("rsi", "REAL"),
         ("volumen_ratio", "REAL"),
+        ("estrategia", "TEXT"),
     ]
     for nombre, tipo in columnas_gates_log_nuevas:
         try:
@@ -724,7 +725,8 @@ def esta_pausado_global() -> bool:
 def guardar_gates_log(par: str, direccion: str, adx: float, adx_umbral_usado: float,
                        paso_adx: bool, paso_ema4h: bool, paso_funding: bool,
                        score: int, score_momentum: int, califico: bool,
-                       atr_pct: float = None, rsi: float = None, volumen_ratio: float = None):
+                       atr_pct: float = None, rsi: float = None, volumen_ratio: float = None,
+                       estrategia: str = "fix28"):
     """
     11/09 — Se agregaron atr_pct, rsi, volumen_ratio (opcionales, con
     default None para no romper llamados viejos) — ANTES solo se
@@ -734,6 +736,11 @@ def guardar_gates_log(par: str, direccion: str, adx: float, adx_umbral_usado: fl
     Guardando esto para TODOS los candidatos evaluados, el próximo
     backtest va a poder probar variantes de ATR/RSI/volumen sin
     depender de que abran posiciones reales primero.
+
+    19/09 FIX: se agregó "estrategia" (fix28/v5) — antes /gates
+    mezclaba chequeos de las 2 sin poder distinguir cuál generó cada
+    fila, imposible de diagnosticar bien. Default "fix28" para no
+    romper el único otro llamado que no lo pasa todavía.
     """
     conn = _conn()
     cur = conn.cursor()
@@ -741,11 +748,11 @@ def guardar_gates_log(par: str, direccion: str, adx: float, adx_umbral_usado: fl
     cur.execute("""
         INSERT INTO gates_log
             (par, direccion, fecha, hora, adx, adx_umbral_usado, paso_adx, paso_ema4h,
-             paso_funding, score, score_momentum, califico, atr_pct, rsi, volumen_ratio, creado)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+             paso_funding, score, score_momentum, califico, atr_pct, rsi, volumen_ratio, estrategia, creado)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     """, (par, direccion, ahora.strftime("%Y%m%d"), ahora.strftime("%H:%M"), adx, adx_umbral_usado,
           int(paso_adx), int(paso_ema4h), int(paso_funding), score, score_momentum, int(califico),
-          atr_pct, rsi, volumen_ratio, ahora.isoformat()))
+          atr_pct, rsi, volumen_ratio, estrategia, ahora.isoformat()))
     conn.commit()
     conn.close()
 
