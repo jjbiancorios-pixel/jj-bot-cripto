@@ -440,9 +440,33 @@ def _cmd_gates(args: list) -> str:
         return f"Sin registros de gates todavía para {par}."
     lineas = [f"🔍 <b>Últimos chequeos — {par}</b>" + (f" ({filtro_estrategia})" if filtro_estrategia else "")]
     for f in filas:
-        gates = f"ADX:{'✅' if f['paso_adx'] else '❌'} EMA4h:{'✅' if f['paso_ema4h'] else '❌'} Funding:{'✅' if f['paso_funding'] else '❌'}"
         etiqueta_estrategia = f['estrategia'] or "fix28"
-        lineas.append(f"{f['fecha']} {f['hora']} | [{etiqueta_estrategia}] {gates} | score {f['score']} (momentum {f['score_momentum']}) | {'CALIFICÓ' if f['califico'] else 'no calificó'}")
+        if etiqueta_estrategia == "v5":
+            # 19/09 FIX (auditoría técnica): V5.0 no usa ADX/EMA4h/Funding/score
+            # como gates de decisión visibles acá — esos 3 (EMA4h, persistencia,
+            # funding) SÍ se mantienen pero se resuelven ANTES de esta etapa; lo
+            # que define "califico" en esta fila es pura y exclusivamente
+            # ADX(1h) y RSI(15m), calculados en el momento a partir del valor
+            # crudo guardado (no hay campo de "score" real en V5.0 — el que
+            # había en la tabla era solo decorativo de una versión anterior).
+            direccion = f['direccion']
+            if direccion in ("LARGO", "CORTO") and f['adx'] is not None and f['rsi'] is not None:
+                import gestion_riesgo
+                if direccion == "LARGO":
+                    paso_adx_v5 = f['adx'] <= gestion_riesgo.ADX_TECHO_V5_LARGO
+                    paso_rsi_v5 = f['rsi'] < gestion_riesgo.RSI_V5_LARGO_MAX
+                else:
+                    paso_adx_v5 = f['adx'] <= gestion_riesgo.ADX_TECHO_V5_CORTO
+                    paso_rsi_v5 = f['rsi'] > gestion_riesgo.RSI_V5_CORTO_MIN
+                gates_v5 = f"ADX({f['adx']:.1f}):{'✅' if paso_adx_v5 else '❌'} RSI({f['rsi']:.1f}):{'✅' if paso_rsi_v5 else '❌'}"
+            else:
+                # Rechazado antes de llegar a ADX/RSI (persistencia, EMA4h o funding)
+                motivo = direccion if direccion == "SIN_PERSISTENCIA" else ("EMA4h" if not f['paso_ema4h'] else "Funding")
+                gates_v5 = f"rechazado antes de ADX/RSI ({motivo})"
+            lineas.append(f"{f['fecha']} {f['hora']} | [v5] {gates_v5} | {'CALIFICÓ' if f['califico'] else 'no calificó'}")
+        else:
+            gates = f"ADX:{'✅' if f['paso_adx'] else '❌'} EMA4h:{'✅' if f['paso_ema4h'] else '❌'} Funding:{'✅' if f['paso_funding'] else '❌'}"
+            lineas.append(f"{f['fecha']} {f['hora']} | [fix28] {gates} | score {f['score']} (momentum {f['score_momentum']}) | {'CALIFICÓ' if f['califico'] else 'no calificó'}")
     return "\n".join(lineas)
 
 
