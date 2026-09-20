@@ -430,12 +430,14 @@ def analizar_par_v5(par: str, btc: dict):
     Juanjo, a diferencia del diseño anterior que sí tenía piso).
     """
     if not pasa_filtro_universo(par):
+        db.guardar_gates_log(par, "FILTRO_UNIVERSO", 0, 0, False, False, False, 0, 0, False, None, None, None, estrategia="v5")
         return None
 
     df15 = get_velas(par, "15m", 100)
     df1h = get_velas(par, "1h", 100)
     df4h = get_velas(par, "4h", 100)
     if df15 is None or df1h is None or df4h is None:
+        db.guardar_gates_log(par, "SIN_DATOS", 0, 0, False, False, False, 0, 0, False, None, None, None, estrategia="v5")
         return None
 
     precio = df15["close"].iloc[-1]
@@ -444,6 +446,7 @@ def analizar_par_v5(par: str, btc: dict):
     ema21_1h = calc_ema(df1h["close"], 21)
     diferencia_ema_pct = abs(ema9_1h - ema21_1h) / ema21_1h * 100 if ema21_1h > 0 else 0
     if diferencia_ema_pct < 0.05:
+        db.guardar_gates_log(par, "SIN_DIRECCION_CLARA", 0, 0, False, False, False, 0, 0, False, None, None, None, estrategia="v5")
         return None
     direccion = "LARGO" if ema9_1h > ema21_1h else "CORTO"
 
