@@ -460,8 +460,13 @@ def _cmd_gates(args: list) -> str:
                     paso_rsi_v5 = f['rsi'] > gestion_riesgo.RSI_V5_CORTO_MIN
                 gates_v5 = f"ADX({f['adx']:.1f}):{'✅' if paso_adx_v5 else '❌'} RSI({f['rsi']:.1f}):{'✅' if paso_rsi_v5 else '❌'}"
             else:
-                # Rechazado antes de llegar a ADX/RSI (persistencia, EMA4h o funding)
-                motivo = direccion if direccion == "SIN_PERSISTENCIA" else ("EMA4h" if not f['paso_ema4h'] else "Funding")
+                # Rechazado antes de llegar a ADX/RSI
+                if direccion in ("SIN_PERSISTENCIA", "SIN_DATOS", "SIN_DIRECCION_CLARA", "FILTRO_UNIVERSO"):
+                    motivo = direccion
+                elif not f['paso_ema4h']:
+                    motivo = "EMA4h"
+                else:
+                    motivo = "Funding"
                 gates_v5 = f"rechazado antes de ADX/RSI ({motivo})"
             lineas.append(f"{f['fecha']} {f['hora']} | [v5] {gates_v5} | {'CALIFICÓ' if f['califico'] else 'no calificó'}")
         else:
