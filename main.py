@@ -88,7 +88,7 @@ SCORE_MOMENTUM_TOPE = 4  # familia RSI+StochRSI+MACD+Bollinger+vela, topeada
 VOLUMEN_RATIO_MINIMO = 1.5
 FUNDING_UMBRAL_PCT = 0.05  # ±0.05%/8h — a calibrar con datos reales
 
-HORA_INICIO, HORA_FIN = 7, 23  # horario operativo ARG
+HORA_INICIO, HORA_FIN = 7, 23  # 19/09: YA NO SE USA — bot debe operar 24hs, ver en_horario_operativo() más abajo
 
 
 def hoy_arg():
@@ -96,7 +96,14 @@ def hoy_arg():
 
 
 def en_horario_operativo() -> bool:
-    return HORA_INICIO <= datetime.now(TZ_ARG).hour < HORA_FIN
+    """
+    19/09 FIX: restricción de horario (7-23hs ARG) era un resabio de
+    versiones muy tempranas — el bot debe operar las 24hs. Confirmado
+    que esto era la causa real de que ciclo_seleccion se congelara
+    todas las noches entre las 23hs y las 7hs, sin ningún error
+    visible (era un `return` limpio, no una falla). Ahora siempre True.
+    """
+    return True
 
 
 # ── Datos: cascada Bybit → OKX → Binance Vision (nunca Pionex) ─────
