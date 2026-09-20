@@ -762,6 +762,32 @@ def ciclo_seleccion():
     for par in PARES:
         if db.par_tiene_posicion_abierta(par):
             continue
+
+        # 19/09 FIX CRÍTICO: V5.0 se evalúa ACÁ, ANTES del gate de
+        # fix28 — antes estaba después de "if not candidato: continue"
+        # (el de fix28), así que si fix28 no calificaba (la gran
+        # mayoría de las veces, por el score≥8 viejo), el loop saltaba
+        # TODO el resto — incluido V5.0 — sin ninguna excepción ni
+        # log visible. Por eso nunca aparecía [v5] en /gates para
+        # NINGÚN par, no era un problema de BTC/ETH puntual.
+        try:
+            candidato_v5 = analizar_par_v5(par, btc)
+        except Exception as e:
+            print(f"Error analizando {par} (V5.0): {e}")
+            candidato_v5 = None
+
+        if candidato_v5:
+            # "V5.0 fiel" — SIEMPRE recopila, sin importar la pausa
+            if not db.par_tiene_simulacion_v5_fiel_abierta(par):
+                db.crear_simulacion_v5_fiel(par, candidato_v5["direccion"], candidato_v5.get("score"),
+                                             candidato_v5.get("adx"), candidato_v5.get("atr_pct"), candidato_v5["precio"])
+
+            if not pausado and not db.par_tiene_posicion_abierta(par):
+                if not (modo_cauto_activo and db.contar_posiciones_por_direccion(candidato_v5["direccion"]) >= 3):
+                    lugar = gestion_riesgo.hay_lugar_para_abrir()
+                    if lugar["hay_lugar"]:
+                        abrir_posicion_real(candidato_v5)
+
         try:
             candidato = analizar_par(par, btc)
         except Exception as e:
@@ -810,32 +836,6 @@ def ciclo_seleccion():
             db.crear_simulacion_fix28_fiel(par, candidato["direccion"], candidato.get("score"),
                                             candidato.get("adx"), candidato.get("atr_pct"), candidato["precio"],
                                             candidato.get("rango_bajo"), candidato.get("rango_alto"))
-
-        # 17/09 — Directiva V5.0: AHORA LA PRINCIPAL, reemplaza a fix28
-        # en el capital real. Se evalúa por separado (gates propios:
-        # filtro de universo + ADX/RSI nuevos, EMA4h/persistencia/
-        # funding se mantienen) — candidato_fix28 (arriba) queda
-        # SOLO para sus 4 simulaciones de comparación, ya no abre
-        # posiciones reales.
-        try:
-            candidato_v5 = analizar_par_v5(par, btc)
-        except Exception as e:
-            print(f"Error analizando {par} (V5.0): {e}")
-            candidato_v5 = None
-
-        if candidato_v5:
-            # "V5.0 fiel" — SIEMPRE recopila, sin importar la pausa
-            if not db.par_tiene_simulacion_v5_fiel_abierta(par):
-                db.crear_simulacion_v5_fiel(par, candidato_v5["direccion"], candidato_v5.get("score"),
-                                             candidato_v5.get("adx"), candidato_v5.get("atr_pct"), candidato_v5["precio"])
-
-            if not pausado and not db.par_tiene_posicion_abierta(par):
-                if not (modo_cauto_activo and db.contar_posiciones_por_direccion(candidato_v5["direccion"]) >= 3):
-                    lugar = gestion_riesgo.hay_lugar_para_abrir()
-                    if lugar["hay_lugar"]:
-                        abrir_posicion_real(candidato_v5)
-
-        continue  # el resto del loop (apertura real vieja con fix28) queda deshabilitado, ver arriba
 
 
 # ── Chequeo rápido de SL/trailing — DIRECTO a Pionex, cada 2seg ────
