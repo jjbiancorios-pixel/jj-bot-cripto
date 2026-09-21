@@ -435,7 +435,7 @@ def resumen_simulaciones(desde_fecha: str = None) -> dict:
     query = "SELECT * FROM simulaciones WHERE cerrado = 1 AND resultado_pct IS NOT NULL"
     params = ()
     if desde_fecha:
-        query += " AND fecha >= ?"
+        query += " AND fecha_cierre >= ?"
         params = (desde_fecha,)
     cur.execute(query, params)
     cerradas = [dict(r) for r in cur.fetchall()]
@@ -680,7 +680,7 @@ def resumen_simulaciones_directivas(desde_fecha: str = None) -> dict:
     query = "SELECT * FROM simulaciones_directivas WHERE cerrado = 1 AND resultado_pct IS NOT NULL"
     params = ()
     if desde_fecha:
-        query += " AND fecha >= ?"
+        query += " AND fecha_cierre >= ?"
         params = (desde_fecha,)
     cur.execute(query, params)
     cerradas = [dict(r) for r in cur.fetchall()]
@@ -935,10 +935,10 @@ def resumen_ponderado(tabla: str, desde_fecha: str = None, hasta_fecha: str = No
     query = f"SELECT resultado_pct, capital_asignado FROM {tabla} WHERE {campo_bu}cerrado = 1 AND resultado_pct IS NOT NULL"
     params = []
     if desde_fecha:
-        query += " AND fecha >= ?"
+        query += " AND fecha_cierre >= ?"
         params.append(desde_fecha)
     if hasta_fecha:
-        query += " AND fecha <= ?"
+        query += " AND fecha_cierre <= ?"
         params.append(hasta_fecha)
     cur.execute(query, tuple(params))
     filas = cur.fetchall()
