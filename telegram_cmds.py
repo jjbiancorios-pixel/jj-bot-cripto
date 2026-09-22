@@ -399,7 +399,8 @@ def _cmd_comparar(args: list) -> str:
             return "sin cierres todavía"
         ponderado = r.get("neto_ponderado_pct")
         ponderado_txt = f"{ponderado:+.2f}%" if ponderado is not None else "s/d (falta capital de hoy)"
-        return f"n={r['n_cerradas']} | win rate {r['win_rate_pct']}% | <b>neto real: {ponderado_txt}</b> (suma simple: {r['resultado_neto_pct']:+.2f}%)"
+        return (f"n={r['n_cerradas']} (✅ {r['n_ganadoras']} | ❌ {r['n_perdedoras']}) | win rate {r['win_rate_pct']}% | "
+                f"<b>neto real: {ponderado_txt}</b> (suma simple: {r['resultado_neto_pct']:+.2f}%)")
 
     r_real = db.resumen_ponderado("senales", desde_fecha, hasta_fecha)
     r_v5_fiel = db.resumen_ponderado("simulaciones_v5_fiel", desde_fecha, hasta_fecha)
