@@ -221,6 +221,73 @@ def calc_rsi(s, p=14):
     return float((100 - 100 / (1 + g / l.replace(0, np.nan))).iloc[-1])
 
 
+def calc_rsi_serie(s, p=14):
+    """20/09 — Directiva V5.2 (Ranking de Fuerza): versión que devuelve la SERIE completa de RSI, no solo el último valor, para poder calcular la pendiente."""
+    d = s.diff()
+    g = d.clip(lower=0).rolling(p).mean()
+    l = (-d.clip(upper=0)).rolling(p).mean()
+    return 100 - 100 / (1 + g / l.replace(0, np.nan))
+
+
+def calcular_pendiente_rsi_3_velas(serie_rsi_15m: list) -> float:
+    """
+    20/09 — Directiva V5.2, provista por Juanjo: pendiente del RSI por
+    regresión lineal simple (mínimos cuadrados) sobre las últimas 3
+    velas de 15m. Verificada con casos de control antes de integrar
+    (RSI subiendo 5pts/vela -> pendiente 5.0; bajando 3pts/vela ->
+    pendiente -3.0; plano -> 0.0 — los 3 dieron exacto).
+    """
+    if len(serie_rsi_15m) < 3:
+        return 0.0
+    y = serie_rsi_15m[-3:]
+    x = [1, 2, 3]
+    n = len(x)
+    suma_x = sum(x)
+    suma_y = sum(y)
+    suma_xy = sum(i * j for i, j in zip(x, y))
+    suma_x_cuadrado = sum(i ** 2 for i in x)
+    denominador = (n * suma_x_cuadrado) - (suma_x ** 2)
+    if denominador == 0:
+        return 0.0
+    pendiente_m = ((n * suma_xy) - (suma_x * suma_y)) / denominador
+    return float(pendiente_m)
+
+
+def aplicar_ranking_de_fuerza_v52(candidatos_calificados_ciclo: list) -> list:
+    """
+    20/09 — Directiva V5.2, provista por Juanjo. Clasifica los
+    candidatos del ciclo de 15m según su aceleración de oscilador —
+    solo los 2 mejores pasan a ejecutarse con capital real.
+
+    FIX aplicado (confirmado por Juanjo): la fórmula de CORTO original
+    usaba abs(pendiente) — igualaba un RSI subiendo rápido (mala señal
+    para CORTO) con uno bajando rápido (buena señal). Corregido a
+    pendiente CON signo, igual que LARGO — una pendiente positiva
+    (RSI subiendo, en contra de un CORTO) ahora resta score en vez de
+    sumar igual que una caída.
+    """
+    if not candidatos_calificados_ciclo:
+        return []
+
+    for par_info in candidatos_calificados_ciclo:
+        rsi_15m = par_info.get("rsi_15m")
+        pendiente = par_info.get("pendiente_rsi", 0.0)
+
+        if rsi_15m is None:
+            par_info["fuerza_score"] = -999.0
+            continue
+
+        if par_info["direccion"] == "LARGO":
+            par_info["fuerza_score"] = (45.0 - rsi_15m) * pendiente
+        else:
+            # CORREGIDO 20/09: pendiente CON signo (negativa = RSI
+            # cayendo = buena señal para CORTO), no abs(pendiente)
+            par_info["fuerza_score"] = (rsi_15m - 55.0) * -pendiente
+
+    candidatos_ordenados = sorted(candidatos_calificados_ciclo, key=lambda x: x.get("fuerza_score", -999.0), reverse=True)
+    return candidatos_ordenados[:2]
+
+
 def calc_atr(df, p=14):
     hl = df["high"] - df["low"]
     hcp = (df["high"] - df["close"].shift()).abs()
@@ -489,7 +556,9 @@ def analizar_par_v5(par: str, btc: dict):
     # ── Gate NUEVO de V5.0: ADX(1h) + RSI(15m), reemplaza ADX+DI+score ──
     adx_info = calc_adx(df1h)
     adx = adx_info["adx"]
-    rsi_15m = calc_rsi(df15["close"])
+    rsi_serie = calc_rsi_serie(df15["close"])
+    rsi_15m = float(rsi_serie.iloc[-1])
+    pendiente_rsi = calcular_pendiente_rsi_3_velas(rsi_serie.tolist())
     atr_abs = calc_atr(df15)
     atr_pct = atr_abs / precio * 100 if precio > 0 else 0
 
@@ -508,6 +577,7 @@ def analizar_par_v5(par: str, btc: dict):
     return {
         "par": par, "direccion": direccion, "precio": precio,
         "adx": round(adx, 2), "rsi": round(rsi_15m, 2), "atr_pct": round(atr_pct, 3),
+        "rsi_15m": rsi_15m, "pendiente_rsi": pendiente_rsi,  # 20/09 — Directiva V5.2 (Ranking de Fuerza)
         "score": 10, "razones": [f"V5.0: ADX(1h)={round(adx,1)} RSI(15m)={round(rsi_15m,1)}"],
         "rango_pct": grid["rango_pct"], "rango_bajo": round(grid["bottom"], 6),
         "rango_alto": round(grid["top"], 6), "grillas": grid["grillas"],
@@ -759,17 +829,20 @@ def ciclo_seleccion():
     actualizar_modo_cauto_btc(btc)
     modo_cauto_activo = db.obtener_estado_btc_cauto()["activo"]
 
+    # 20/09 — Directiva V5.2 (Ranking de Fuerza): ya NO se abre apenas
+    # un candidato de V5.0 califica — se juntan TODOS los candidatos
+    # calificados del ciclo (120 pares), se rankean por fuerza de
+    # oscilador, y solo los 2 mejores pasan a abrir con capital real
+    # (y a alimentar "V5.0 fiel", para que la comparación siga siendo
+    # fiel a lo que realmente hace la real). Objetivo: eliminar la
+    # asignación de capital "por orden de aparición" en la lista de
+    # pares, que no tiene ningún fundamento de calidad de señal.
+    candidatos_v5_calificados = []
+
     for par in PARES:
         if db.par_tiene_posicion_abierta(par):
             continue
 
-        # 19/09 FIX CRÍTICO: V5.0 se evalúa ACÁ, ANTES del gate de
-        # fix28 — antes estaba después de "if not candidato: continue"
-        # (el de fix28), así que si fix28 no calificaba (la gran
-        # mayoría de las veces, por el score≥8 viejo), el loop saltaba
-        # TODO el resto — incluido V5.0 — sin ninguna excepción ni
-        # log visible. Por eso nunca aparecía [v5] en /gates para
-        # NINGÚN par, no era un problema de BTC/ETH puntual.
         try:
             candidato_v5 = analizar_par_v5(par, btc)
         except Exception as e:
@@ -777,16 +850,7 @@ def ciclo_seleccion():
             candidato_v5 = None
 
         if candidato_v5:
-            # "V5.0 fiel" — SIEMPRE recopila, sin importar la pausa
-            if not db.par_tiene_simulacion_v5_fiel_abierta(par):
-                db.crear_simulacion_v5_fiel(par, candidato_v5["direccion"], candidato_v5.get("score"),
-                                             candidato_v5.get("adx"), candidato_v5.get("atr_pct"), candidato_v5["precio"])
-
-            if not pausado and not db.par_tiene_posicion_abierta(par):
-                if not (modo_cauto_activo and db.contar_posiciones_por_direccion(candidato_v5["direccion"]) >= 3):
-                    lugar = gestion_riesgo.hay_lugar_para_abrir()
-                    if lugar["hay_lugar"]:
-                        abrir_posicion_real(candidato_v5)
+            candidatos_v5_calificados.append(candidato_v5)
 
         try:
             candidato = analizar_par(par, btc)
@@ -836,6 +900,22 @@ def ciclo_seleccion():
             db.crear_simulacion_fix28_fiel(par, candidato["direccion"], candidato.get("score"),
                                             candidato.get("adx"), candidato.get("atr_pct"), candidato["precio"],
                                             candidato.get("rango_bajo"), candidato.get("rango_alto"))
+
+    # ── V5.2 — Ranking de Fuerza: recién ACÁ, con los 120 pares ya
+    # evaluados, se aplica el ranking y se actúa sobre los 2 mejores ──
+    mejores_v5 = aplicar_ranking_de_fuerza_v52(candidatos_v5_calificados)
+    for candidato_v5 in mejores_v5:
+        par = candidato_v5["par"]
+        # "V5.0 fiel" — SIEMPRE recopila (de los 2 mejores), sin importar la pausa
+        if not db.par_tiene_simulacion_v5_fiel_abierta(par):
+            db.crear_simulacion_v5_fiel(par, candidato_v5["direccion"], candidato_v5.get("score"),
+                                         candidato_v5.get("adx"), candidato_v5.get("atr_pct"), candidato_v5["precio"])
+
+        if not pausado and not db.par_tiene_posicion_abierta(par):
+            if not (modo_cauto_activo and db.contar_posiciones_por_direccion(candidato_v5["direccion"]) >= 3):
+                lugar = gestion_riesgo.hay_lugar_para_abrir()
+                if lugar["hay_lugar"]:
+                    abrir_posicion_real(candidato_v5)
 
 
 # ── Chequeo rápido de SL/trailing — DIRECTO a Pionex, cada 2seg ────
