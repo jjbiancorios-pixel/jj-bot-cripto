@@ -423,6 +423,45 @@ def _cmd_comparar(args: list) -> str:
             f"🔀 Combo (entrada Directivas + salida original): {_fmt(r_combo)}")
 
 
+def _cmd_detalle_v55(args: list) -> str:
+    """
+    25/09 — Diagnóstico de "V5.5 fiel" (simulaciones_v55): detalle de
+    operaciones cerradas para decidir si hace falta estirar el SL
+    (-25% apalancado) por asfixia. Por defecto solo las PERDEDORAS —
+    con par, dirección, precio de entrada, pico máximo alcanzado,
+    resultado, motivo de cierre y fecha/hora de apertura y cierre,
+    para poder después consultar cómo siguió cotizando el par tras el
+    cierre (¿hubiera recuperado con un SL más ancho, o siguió cayendo?).
+    Uso: /detalle_v55 [todo] — "todo" incluye también las ganadoras.
+    """
+    solo_perdedoras = not (args and args[0].lower() == "todo")
+    import sqlite3
+    conn = sqlite3.connect(db.DB_PATH)
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM simulaciones_v55 WHERE cerrado = 1 AND resultado_pct IS NOT NULL ORDER BY id DESC LIMIT 50")
+    filas = [dict(r) for r in cur.fetchall()]
+    conn.close()
+
+    if solo_perdedoras:
+        filas = [f for f in filas if f["resultado_pct"] <= 0]
+
+    if not filas:
+        return "Sin operaciones perdedoras cerradas todavía en V5.5 fiel." if solo_perdedoras else "Sin cierres todavía en V5.5 fiel."
+
+    lineas = [f"🔍 <b>Detalle V5.5 fiel</b> ({'perdedoras' if solo_perdedoras else 'todas'}, últimas {len(filas)})"]
+    for f in filas:
+        emoji = "🔴" if f["resultado_pct"] <= 0 else "🟢"
+        lineas.append(
+            f"\n{emoji} <b>{f['par']} {f['direccion']}</b>\n"
+            f"Entrada: {f['precio_entrada']} | Pico máx: {(f.get('pico_maximo_pct') or 0):.2f}%\n"
+            f"Resultado: {f['resultado_pct']:+.2f}% | Motivo: {f['motivo_cierre']}\n"
+            f"Abierta: {f['fecha']} {f['hora']} ARG | Cerrada: {f['fecha_cierre']} {f['hora_cierre']} ARG\n"
+            f"ADX: {f.get('adx')} | ATR%: {f.get('atr_pct')}"
+        )
+    return "\n".join(lineas)
+
+
 def _cmd_gates(args: list) -> str:
     if not args:
         return "Uso: /gates PAR [fix28|v5]\nEj: /gates BTC v5"
@@ -506,6 +545,8 @@ def procesar_comando(texto: str) -> str:
         return _cmd_backup_db()
     elif cmd == "/gates":
         return _cmd_gates(args)
+    elif cmd == "/detalle_v55":
+        return _cmd_detalle_v55(args)
     elif cmd == "/simulaciones":
         return _cmd_simulaciones(args)
     elif cmd == "/directivas":
@@ -525,6 +566,8 @@ def procesar_comando(texto: str) -> str:
             "/pendientes — posiciones abiertas ahora, con pico y tramo de trailing\n"
             "/capital — capital del día (interés compuesto)\n"
             "/gates PAR [fix28|v5] — últimos 10 chequeos de gates para un par (diagnóstico)\n"
+            "/detalle_v55 [todo] — detalle de cierres de V5.5 fiel (por defecto solo perdedoras): "
+            "entrada, pico máximo, resultado, motivo y fecha/hora — para diagnosticar el SL\n"
             "/informe [FECHA|todo] — informe completo para análisis: ganadoras/perdedoras, "
             "promedios, neto, por motivo, score, selectividad. Ej: /informe todo\n"
             "/comparar [FECHA [FECHA_HASTA]|todo] — las 7 estrategias juntas (real V5.5, "
