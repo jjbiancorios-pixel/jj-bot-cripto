@@ -469,17 +469,39 @@ def _cmd_seguimiento_v55(args: list) -> str:
     checkpoints de 1/2/4/6/8/12hs — para decidir si conviene estirar
     el SL (-25% apalancado) con datos objetivos en vez de memoria o
     reconstrucción externa.
-    Uso: /seguimiento_v55 [N] — últimos N (default 5)
+
+    25/09 FIX (a pedido de Juanjo): agregado el filtro "sl" para ver
+    solo las que cerraron por stop_loss (las candidatas a "SL corto") —
+    antes solo mostraba las N más recientes sin importar el motivo, así
+    que si las últimas fueron todas ganadoras por trailing, las
+    perdedoras por SL quedaban afuera aunque hubiera pedido más.
+    Uso: /seguimiento_v55 [sl] [N] — "sl" filtra solo stop_loss,
+    N = cuántas mostrar (default 5, sin corchetes al escribirlo)
+    Ej: /seguimiento_v55 sl 20
     """
+    resto = list(args)
+    solo_sl = bool(resto) and resto[0].lower() in ("sl", "stop_loss")
+    if solo_sl:
+        resto = resto[1:]
     try:
-        n = int(args[0]) if args else 5
+        n = int(resto[0]) if resto else 5
     except ValueError:
         n = 5
-    filas = db.seguimientos_v55_recientes(n)
-    if not filas:
-        return "Sin seguimientos post-cierre de V5.5 todavía."
 
-    lineas = [f"🕐 <b>Seguimiento post-cierre V5.5</b> (últimos {len(filas)})"]
+    # 25/09 FIX: trae una ventana amplia (50) SIEMPRE y filtra/recorta
+    # en Python — si se pidiera "n" directo a la base y después se
+    # filtrara por motivo, con mala suerte de orden podían quedar 0
+    # resultados aunque sí hubiera SL más atrás en el historial.
+    filas = db.seguimientos_v55_recientes(50)
+    if solo_sl:
+        filas = [f for f in filas if f["motivo_cierre"] == "stop_loss"]
+    filas = filas[:n]
+
+    if not filas:
+        return "Sin cierres por stop_loss todavía en V5.5 fiel." if solo_sl else "Sin seguimientos post-cierre de V5.5 todavía."
+
+    etiqueta = "solo stop_loss, " if solo_sl else ""
+    lineas = [f"🕐 <b>Seguimiento post-cierre V5.5</b> ({etiqueta}últimos {len(filas)})"]
     for f in filas:
         estado = "✅ completo (12hs)" if f["terminado"] else "⏳ en curso"
         lineas.append(
@@ -602,8 +624,9 @@ def procesar_comando(texto: str) -> str:
             "/gates PAR [fix28|v5] — últimos 10 chequeos de gates para un par (diagnóstico)\n"
             "/detalle_v55 [todo] — detalle de cierres de V5.5 fiel (por defecto solo perdedoras): "
             "entrada, pico máximo, resultado, motivo y fecha/hora — para diagnosticar el SL\n"
-            "/seguimiento_v55 [N] — cómo siguió cotizando cada par 12hs después del cierre de "
-            "V5.5 fiel (checkpoints 1/2/4/6/8/12hs) — para decidir si conviene estirar el SL\n"
+            "/seguimiento_v55 [sl] [N] — cómo siguió cotizando cada par 12hs después del cierre de "
+            "V5.5 fiel (checkpoints 1/2/4/6/8/12hs). \"sl\" filtra solo las que cerraron por stop_loss "
+            "(sin corchetes al escribir el número). Ej: /seguimiento_v55 sl 20\n"
             "/informe [FECHA|todo] — informe completo para análisis: ganadoras/perdedoras, "
             "promedios, neto, por motivo, score, selectividad. Ej: /informe todo\n"
             "/comparar [FECHA [FECHA_HASTA]|todo] — las 7 estrategias juntas (real V5.5, "
