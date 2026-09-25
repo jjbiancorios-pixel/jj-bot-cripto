@@ -462,6 +462,38 @@ def _cmd_detalle_v55(args: list) -> str:
     return "\n".join(lineas)
 
 
+def _cmd_seguimiento_v55(args: list) -> str:
+    """
+    25/09 — Muestra el seguimiento post-cierre de V5.5 fiel: qué pasó
+    con el precio del par en las 12hs posteriores al cierre, en
+    checkpoints de 1/2/4/6/8/12hs — para decidir si conviene estirar
+    el SL (-25% apalancado) con datos objetivos en vez de memoria o
+    reconstrucción externa.
+    Uso: /seguimiento_v55 [N] — últimos N (default 5)
+    """
+    try:
+        n = int(args[0]) if args else 5
+    except ValueError:
+        n = 5
+    filas = db.seguimientos_v55_recientes(n)
+    if not filas:
+        return "Sin seguimientos post-cierre de V5.5 todavía."
+
+    lineas = [f"🕐 <b>Seguimiento post-cierre V5.5</b> (últimos {len(filas)})"]
+    for f in filas:
+        estado = "✅ completo (12hs)" if f["terminado"] else "⏳ en curso"
+        lineas.append(
+            f"\n<b>{f['par']} {f['direccion']}</b> — {estado}\n"
+            f"Cierre real: {f['resultado_cierre_pct']:+.2f}% ({f['motivo_cierre']})"
+        )
+        for horas in db.CHECKPOINTS_SEGUIMIENTO_V55:
+            r = f.get(f"resultado_{horas}h_pct")
+            p = f.get(f"precio_{horas}h")
+            if r is not None:
+                lineas.append(f"  +{horas}h: precio {p} → hubiera estado en {r:+.2f}%")
+    return "\n".join(lineas)
+
+
 def _cmd_gates(args: list) -> str:
     if not args:
         return "Uso: /gates PAR [fix28|v5]\nEj: /gates BTC v5"
@@ -547,6 +579,8 @@ def procesar_comando(texto: str) -> str:
         return _cmd_gates(args)
     elif cmd == "/detalle_v55":
         return _cmd_detalle_v55(args)
+    elif cmd == "/seguimiento_v55":
+        return _cmd_seguimiento_v55(args)
     elif cmd == "/simulaciones":
         return _cmd_simulaciones(args)
     elif cmd == "/directivas":
@@ -568,6 +602,8 @@ def procesar_comando(texto: str) -> str:
             "/gates PAR [fix28|v5] — últimos 10 chequeos de gates para un par (diagnóstico)\n"
             "/detalle_v55 [todo] — detalle de cierres de V5.5 fiel (por defecto solo perdedoras): "
             "entrada, pico máximo, resultado, motivo y fecha/hora — para diagnosticar el SL\n"
+            "/seguimiento_v55 [N] — cómo siguió cotizando cada par 12hs después del cierre de "
+            "V5.5 fiel (checkpoints 1/2/4/6/8/12hs) — para decidir si conviene estirar el SL\n"
             "/informe [FECHA|todo] — informe completo para análisis: ganadoras/perdedoras, "
             "promedios, neto, por motivo, score, selectividad. Ej: /informe todo\n"
             "/comparar [FECHA [FECHA_HASTA]|todo] — las 7 estrategias juntas (real V5.5, "

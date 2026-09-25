@@ -986,6 +986,64 @@ def ciclo_seleccion():
                     abrir_posicion_real(candidato_v55)
 
 
+# ── 25/09 — Seguimiento post-cierre de V5.5 fiel (12hs) ─────────
+def procesar_seguimiento_post_cierre_v55():
+    """
+    Para cada cierre de V5.5 fiel (SL, trailing, lo que sea) se sigue
+    consultando el precio del par durante 12hs MÁS, en 6 checkpoints
+    fijos (1/2/4/6/8/12hs desde el cierre) — a pedido de Juanjo, para
+    poder ver objetivamente "qué hubiera pasado" con un SL más ancho,
+    sin depender de reconstruir el historial después con una fuente
+    externa (que además resultó no confiable para fechas específicas).
+
+    No toca el resultado ya guardado de la simulación — esto es pura
+    observación adicional en una tabla aparte. Corre en el mismo hilo
+    de 2seg que el resto de los chequeos, así que el costo es mínimo
+    (una consulta de precio por par pendiente, no por checkpoint).
+    """
+    pendientes = db.seguimientos_v55_pendientes()
+    if not pendientes:
+        return
+
+    for seg in pendientes:
+        try:
+            creado_dt = datetime.fromisoformat(seg["creado"])
+        except Exception:
+            db.marcar_seguimiento_v55_terminado(seg["id"])  # dato corrupto, no reintentar para siempre
+            continue
+
+        horas_transcurridas = (datetime.now(TZ_ARG) - creado_dt).total_seconds() / 3600
+        signo = 1 if seg["direccion"] == "LARGO" else -1
+
+        checkpoint_pendiente = None
+        for horas in db.CHECKPOINTS_SEGUIMIENTO_V55:
+            ya_guardado = seg.get(f"precio_{horas}h") is not None
+            if not ya_guardado and horas_transcurridas >= horas:
+                checkpoint_pendiente = horas
+                break  # solo 1 checkpoint por vuelta — si pasó mucho tiempo sin correr, los va completando de a uno
+
+        if checkpoint_pendiente is not None:
+            precio_actual = get_precio(seg["par"])
+            if precio_actual is not None:
+                # Mismo criterio que el resto del sistema: % de cambio de
+                # precio SIEMPRE relativo a precio_entrada original (no
+                # compuesto desde el precio de cierre) — así el checkpoint
+                # es directamente comparable con resultado_cierre_pct.
+                cambio_precio_pct = (precio_actual - seg["precio_entrada"]) / seg["precio_entrada"] * 100
+                resultado_hipotetico_pct = cambio_precio_pct * signo * gestion_riesgo.LEVERAGE_FIJO
+                db.guardar_checkpoint_seguimiento_v55(seg["id"], checkpoint_pendiente, precio_actual, resultado_hipotetico_pct)
+                # 25/09 FIX (encontrado con test): solo se marca terminado
+                # cuando efectivamente se completó el ÚLTIMO checkpoint
+                # (12hs), no solo por haber pasado 12hs de reloj — si el
+                # bot estuvo caído y el tiempo "saltó" de golpe, este
+                # límite por tiempo cortaba el seguimiento habiendo
+                # llenado solo 1 o 2 checkpoints, perdiendo el resto para
+                # siempre. Así, aunque haya que "ponerse al día" de a un
+                # checkpoint por vuelta (cada 2seg), ninguno se pierde.
+                if checkpoint_pendiente == max(db.CHECKPOINTS_SEGUIMIENTO_V55):
+                    db.marcar_seguimiento_v55_terminado(seg["id"])
+
+
 # ── Chequeo rápido de SL/trailing — DIRECTO a Pionex, cada 2seg ────
 def chequeo_rapido_riesgo():
     """
@@ -1195,8 +1253,19 @@ def chequeo_rapido_riesgo():
                 decision_sim = gestion_riesgo.evaluar_cierre_v55(sim["direccion"], sim["pico_maximo_pct"], resultado_actual_sim)
                 if decision_sim["cerrar"]:
                     db.cerrar_simulacion_v55(sim["id"], resultado_actual_sim, decision_sim["motivo"])
+                    # 25/09 — Arranca el seguimiento post-cierre (12hs, checkpoints
+                    # fijos): a pedido de Juanjo, para saber objetivamente cómo
+                    # siguió cotizando el par después de cerrar, sin depender de
+                    # reconstruir el historial después con una fuente externa.
+                    db.crear_seguimiento_v55(sim["id"], sim["par"], sim["direccion"], sim["precio_entrada"],
+                                              precio_actual_sim, resultado_actual_sim, decision_sim["motivo"])
                 else:
                     db.actualizar_pico_simulacion_v55(sim["id"], decision_sim["pico_nuevo"])
+
+            # ── 25/09: seguimiento post-cierre de V5.5 fiel — registra el precio
+            # en checkpoints fijos (1/2/4/6/8/12hs) para cada cierre, sin afectar
+            # el resultado ya guardado. Corre en el mismo hilo de 2seg. ──
+            procesar_seguimiento_post_cierre_v55()
         except Exception as e:
             print(f"⚠️ chequeo_rapido_riesgo: {e}", flush=True)
         time.sleep(2)

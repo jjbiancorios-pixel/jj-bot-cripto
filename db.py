@@ -321,6 +321,34 @@ def _crear_tabla_simulaciones(cur):
         )
     """)
 
+    # 25/09 — Seguimiento post-cierre de V5.5 fiel: cuando una simulación
+    # cierra (SL, trailing, lo que sea), se sigue registrando el precio
+    # del par durante 12hs MÁS, en checkpoints fijos (1h/2h/4h/6h/8h/12h),
+    # para poder ver objetivamente "qué hubiera pasado" si el SL fuera
+    # más ancho — sin depender de reconstruir el historial después con
+    # una fuente externa. No afecta el resultado ya cerrado, es pura
+    # observación adicional.
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS seguimiento_v55 (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            sim_id INTEGER NOT NULL,
+            par TEXT NOT NULL,
+            direccion TEXT NOT NULL,
+            precio_entrada REAL,
+            precio_cierre REAL,
+            resultado_cierre_pct REAL,
+            motivo_cierre TEXT,
+            creado TEXT NOT NULL,
+            terminado INTEGER DEFAULT 0,
+            precio_1h REAL, resultado_1h_pct REAL,
+            precio_2h REAL, resultado_2h_pct REAL,
+            precio_4h REAL, resultado_4h_pct REAL,
+            precio_6h REAL, resultado_6h_pct REAL,
+            precio_8h REAL, resultado_8h_pct REAL,
+            precio_12h REAL, resultado_12h_pct REAL
+        )
+    """)
+
     # 24/09 — Directiva V5.5 ("Estrategia Simplificada"): reemplaza a
     # V5.0 como la que opera con capital REAL (V5.0 pasa a modo sombra
     # exclusivo desde acá, junto con fix28/Simulación original/Directivas/
@@ -616,6 +644,61 @@ def cerrar_simulacion_v55(sim_id: int, resultado_pct: float, motivo: str):
     """, (resultado_pct, motivo, ahora.strftime("%Y%m%d"), ahora.strftime("%H:%M"), sim_id))
     conn.commit()
     conn.close()
+
+
+# ── 25/09 — Seguimiento post-cierre de V5.5 fiel (12hs, checkpoints fijos) ──
+CHECKPOINTS_SEGUIMIENTO_V55 = (1, 2, 4, 6, 8, 12)  # horas desde el cierre
+
+
+def crear_seguimiento_v55(sim_id: int, par: str, direccion: str, precio_entrada: float, precio_cierre: float,
+                           resultado_cierre_pct: float, motivo_cierre: str) -> int:
+    conn = _conn()
+    cur = conn.cursor()
+    ahora = datetime.now(TZ_ARG)
+    cur.execute("""
+        INSERT INTO seguimiento_v55 (sim_id, par, direccion, precio_entrada, precio_cierre, resultado_cierre_pct, motivo_cierre, creado)
+        VALUES (?,?,?,?,?,?,?,?)
+    """, (sim_id, par, direccion, precio_entrada, precio_cierre, resultado_cierre_pct, motivo_cierre, ahora.isoformat()))
+    conn.commit()
+    seg_id = cur.lastrowid
+    conn.close()
+    return seg_id
+
+
+def seguimientos_v55_pendientes() -> list:
+    conn = _conn()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM seguimiento_v55 WHERE terminado = 0")
+    rows = [dict(r) for r in cur.fetchall()]
+    conn.close()
+    return rows
+
+
+def guardar_checkpoint_seguimiento_v55(seg_id: int, horas: int, precio: float, resultado_pct: float):
+    """Guarda el checkpoint de N horas (1/2/4/6/8/12) — columnas fijas, una por checkpoint."""
+    conn = _conn()
+    cur = conn.cursor()
+    cur.execute(f"UPDATE seguimiento_v55 SET precio_{horas}h = ?, resultado_{horas}h_pct = ? WHERE id = ?",
+                (precio, resultado_pct, seg_id))
+    conn.commit()
+    conn.close()
+
+
+def marcar_seguimiento_v55_terminado(seg_id: int):
+    conn = _conn()
+    cur = conn.cursor()
+    cur.execute("UPDATE seguimiento_v55 SET terminado = 1 WHERE id = ?", (seg_id,))
+    conn.commit()
+    conn.close()
+
+
+def seguimientos_v55_recientes(limite: int = 10) -> list:
+    conn = _conn()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM seguimiento_v55 ORDER BY id DESC LIMIT ?", (limite,))
+    rows = [dict(r) for r in cur.fetchall()]
+    conn.close()
+    return rows
 
 
 def par_tiene_simulacion_combo_abierta(par: str) -> bool:
