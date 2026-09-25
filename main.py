@@ -288,6 +288,46 @@ def aplicar_ranking_de_fuerza_v52(candidatos_calificados_ciclo: list) -> list:
     return candidatos_ordenados[:2]
 
 
+def aplicar_ranking_v55(candidatos_calificados_ciclo: list) -> list:
+    """
+    24/09 — Directiva V5.5 ("Estrategia Simplificada"), provista por
+    Juanjo. Reemplaza a V5.0 (aplicar_ranking_de_fuerza_v52) como la
+    que opera con capital REAL — V5.0 pasa a modo sombra exclusivo.
+
+    Punto 1 ("ELIMINACIÓN DE PENDIENTES"): a diferencia de V5.2, este
+    ranking NO usa la pendiente de RSI para nada — se deja el cálculo
+    de pendiente intacto en el resto del código porque "V5.0 fiel"
+    (que sigue vigente en sombra, según lo pedido explícitamente por
+    Juanjo: "siguen todas las estrategias vigentes y en modo sombra")
+    todavía depende de él para su propio ranking. Acá simplemente no
+    se lee ese campo.
+
+    Punto 2 ("RANKING DE FUERZA PURO"): score por resta directa contra
+    el umbral de RSI de entrada de V5.0 (45 LARGO / 55 CORTO) — cuanto
+    más lejos esté el RSI(15m) de ese umbral, en la dirección
+    correcta, más alto el score. Se ordena de mayor a menor y se
+    toman los 2 mejores del ciclo de 15 minutos — mismo patrón de
+    selección que V5.2, ranking distinto.
+    """
+    if not candidatos_calificados_ciclo:
+        return []
+
+    for par_info in candidatos_calificados_ciclo:
+        rsi_15m = par_info.get("rsi_15m")
+
+        if rsi_15m is None:
+            par_info["fuerza_score_v55"] = -999.0
+            continue
+
+        if par_info["direccion"] == "LARGO":
+            par_info["fuerza_score_v55"] = 45.0 - rsi_15m
+        else:
+            par_info["fuerza_score_v55"] = rsi_15m - 55.0
+
+    candidatos_ordenados = sorted(candidatos_calificados_ciclo, key=lambda x: x.get("fuerza_score_v55", -999.0), reverse=True)
+    return candidatos_ordenados[:2]
+
+
 def calc_atr(df, p=14):
     hl = df["high"] - df["low"]
     hcp = (df["high"] - df["close"].shift()).abs()
@@ -901,8 +941,12 @@ def ciclo_seleccion():
                                             candidato.get("adx"), candidato.get("atr_pct"), candidato["precio"],
                                             candidato.get("rango_bajo"), candidato.get("rango_alto"))
 
-    # ── V5.2 — Ranking de Fuerza: recién ACÁ, con los 120 pares ya
-    # evaluados, se aplica el ranking y se actúa sobre los 2 mejores ──
+    # ── V5.2 — Ranking de Fuerza (AHORA EN SOMBRA): recién ACÁ, con los
+    # 120 pares ya evaluados, se aplica el ranking de V5.0 y se recopila
+    # en "V5.0 fiel" — YA NO abre con capital real desde el 24/09
+    # (Directiva V5.5 la reemplazó). Sigue recopilando datos SIEMPRE,
+    # sin importar la pausa, tal como pidió Juanjo explícitamente
+    # ("siguen todas las estrategias vigentes y en modo sombra").
     mejores_v5 = aplicar_ranking_de_fuerza_v52(candidatos_v5_calificados)
     for candidato_v5 in mejores_v5:
         par = candidato_v5["par"]
@@ -910,12 +954,36 @@ def ciclo_seleccion():
         if not db.par_tiene_simulacion_v5_fiel_abierta(par):
             db.crear_simulacion_v5_fiel(par, candidato_v5["direccion"], candidato_v5.get("score"),
                                          candidato_v5.get("adx"), candidato_v5.get("atr_pct"), candidato_v5["precio"])
+        # 24/09: ya NO se abre posición real acá — V5.0 quedó en modo sombra exclusivo.
+
+    # ── 24/09 — Directiva V5.5 ("Estrategia Simplificada"): AHORA LA
+    # REAL. Mismo pool de candidatos que V5.0 (candidatos_v5_calificados,
+    # ya pasaron el filtro de universo + gates + ADX/RSI), pero con
+    # ranking puro (sin pendiente) y su propia gestión de riesgo
+    # (SL -25% apalancado / TP trailing +5% apalancado). Los 2 mejores
+    # del ciclo son los que abren con capital real cuando el bot está
+    # activo.
+    mejores_v55 = aplicar_ranking_v55(candidatos_v5_calificados)
+    for candidato_v55 in mejores_v55:
+        par = candidato_v55["par"]
+        # "V5.5" — SIEMPRE recopila (de los 2 mejores), sin importar la
+        # pausa. 24/09: ahora respeta el MISMO tope que tendría operando
+        # real — 6 simulaciones abiertas a la vez y 2 aperturas nuevas
+        # por ciclo de 15min (medido contra su propia tabla de
+        # simulación, no contra la real) — para que la sombra sea fiel
+        # a cómo se comportaría el bot de verdad, no una lista libre sin
+        # límite de posiciones simultáneas.
+        if not db.par_tiene_simulacion_v55_abierta(par):
+            lugar_sim = gestion_riesgo.hay_lugar_para_abrir_v55()
+            if lugar_sim["hay_lugar"]:
+                db.crear_simulacion_v55(par, candidato_v55["direccion"], candidato_v55.get("score"),
+                                         candidato_v55.get("adx"), candidato_v55.get("atr_pct"), candidato_v55["precio"])
 
         if not pausado and not db.par_tiene_posicion_abierta(par):
-            if not (modo_cauto_activo and db.contar_posiciones_por_direccion(candidato_v5["direccion"]) >= 3):
+            if not (modo_cauto_activo and db.contar_posiciones_por_direccion(candidato_v55["direccion"]) >= 3):
                 lugar = gestion_riesgo.hay_lugar_para_abrir()
                 if lugar["hay_lugar"]:
-                    abrir_posicion_real(candidato_v5)
+                    abrir_posicion_real(candidato_v55)
 
 
 # ── Chequeo rápido de SL/trailing — DIRECTO a Pionex, cada 2seg ────
@@ -967,14 +1035,18 @@ def chequeo_rapido_riesgo():
 
                 db.actualizar_mae_mfe(senal["id"], resultado_pct)
 
-                # 17/09 — Directiva V5.0: las posiciones REALES ahora
-                # usan la salida de V5.0 (SL -4,5% + trailing 1 tramo),
-                # no la de fix28 (que tenía fuera-de-rango/BTC-en-contra
-                # — V5.0 no las mantiene, según la directiva).
+                # 24/09 — Directiva V5.5: las posiciones REALES ahora
+                # usan la salida de V5.5 (SL -25% apalancado / -2,5%
+                # real + trailing 1 tramo, activa en +5% apalancado),
+                # reemplazando a la salida de V5.0 (SL -4,5%, que venía
+                # mostrando "asfixia" — cierres por ruido antes de que
+                # la posición pudiera desarrollarse). evaluar_cierre_v5
+                # sigue existiendo intacta, usada por la simulación
+                # "V5.0 fiel" (ahora en sombra).
                 pico_actual_senal = senal.get("pico_maximo_pct", 0) or 0
-                decision_v5 = gestion_riesgo.evaluar_cierre_v5(senal["direccion"], pico_actual_senal, resultado_pct)
-                db.actualizar_pico_y_tramo(senal["id"], decision_v5["pico_nuevo"], "unico", decision_v5["pico_nuevo"] >= gestion_riesgo.PICO_ACTIVACION_V5_PCT)
-                decision = decision_v5
+                decision_v55 = gestion_riesgo.evaluar_cierre_v55(senal["direccion"], pico_actual_senal, resultado_pct)
+                db.actualizar_pico_y_tramo(senal["id"], decision_v55["pico_nuevo"], "unico", decision_v55["pico_nuevo"] >= gestion_riesgo.PICO_ACTIVACION_V55_PCT)
+                decision = decision_v55
                 if decision["cerrar"]:
                     cierre = pionex_api.cerrar_grilla_futuros(senal["bu_order_id"], nota=decision["motivo"])
                     if not cierre["ok"]:
@@ -1109,6 +1181,22 @@ def chequeo_rapido_riesgo():
                     db.cerrar_simulacion_v5_fiel(sim["id"], resultado_actual_sim, decision_sim["motivo"])
                 else:
                     db.actualizar_pico_simulacion_v5_fiel(sim["id"], decision_sim["pico_nuevo"])
+
+            # ── 24/09: chequeo de "V5.5" (la NUEVA principal, sin capital real —
+            # esta tabla además alimenta directamente a la posición real, que
+            # usa evaluar_cierre_v55 arriba con datos consultados directo a Pionex) ──
+            for sim in db.simulaciones_v55_abiertas():
+                precio_actual_sim = get_precio(sim["par"])
+                if precio_actual_sim is None:
+                    continue
+                cambio_precio_pct = (precio_actual_sim - sim["precio_entrada"]) / sim["precio_entrada"] * 100
+                signo = 1 if sim["direccion"] == "LARGO" else -1
+                resultado_actual_sim = cambio_precio_pct * signo * gestion_riesgo.LEVERAGE_FIJO
+                decision_sim = gestion_riesgo.evaluar_cierre_v55(sim["direccion"], sim["pico_maximo_pct"], resultado_actual_sim)
+                if decision_sim["cerrar"]:
+                    db.cerrar_simulacion_v55(sim["id"], resultado_actual_sim, decision_sim["motivo"])
+                else:
+                    db.actualizar_pico_simulacion_v55(sim["id"], decision_sim["pico_nuevo"])
         except Exception as e:
             print(f"⚠️ chequeo_rapido_riesgo: {e}", flush=True)
         time.sleep(2)

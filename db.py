@@ -321,13 +321,42 @@ def _crear_tabla_simulaciones(cur):
         )
     """)
 
+    # 24/09 — Directiva V5.5 ("Estrategia Simplificada"): reemplaza a
+    # V5.0 como la que opera con capital REAL (V5.0 pasa a modo sombra
+    # exclusivo desde acá, junto con fix28/Simulación original/Directivas/
+    # Combo, que ya estaban en sombra). Mismo pool de candidatos que V5.0
+    # (mismos gates: filtro de universo, EMA4h, persistencia, funding,
+    # ADX+RSI) — lo que cambia es el RANKING (puro, sin pendiente) y la
+    # gestión de riesgo (SL/TP). Recopila SIEMPRE, sin importar la pausa.
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS simulaciones_v55 (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            par TEXT NOT NULL,
+            direccion TEXT NOT NULL,
+            score INTEGER,
+            adx REAL,
+            atr_pct REAL,
+            precio_entrada REAL,
+            pico_maximo_pct REAL DEFAULT 0,
+            capital_asignado REAL,
+            fecha TEXT NOT NULL,
+            hora TEXT NOT NULL,
+            cerrado INTEGER DEFAULT 0,
+            resultado_pct REAL,
+            motivo_cierre TEXT,
+            fecha_cierre TEXT,
+            hora_cierre TEXT,
+            creado TEXT NOT NULL
+        )
+    """)
+
     # 16/09: capital_asignado para calcular el resultado PONDERADO (no
     # la suma simple) — misma fórmula documentada en v16: cada
     # operación aporta (resultado_pct/100 * capital_asignado) en USD,
     # el total se divide por el capital total de la cartera. Las
     # simulaciones usan el mismo 5% que usaría la real, para que la
     # comparación sea de manzanas con manzanas.
-    for tabla in ("simulaciones", "simulaciones_directivas", "simulaciones_combo", "simulaciones_fix28_fiel", "simulaciones_v5_fiel"):
+    for tabla in ("simulaciones", "simulaciones_directivas", "simulaciones_combo", "simulaciones_fix28_fiel", "simulaciones_v5_fiel", "simulaciones_v55"):
         try:
             cur.execute(f"ALTER TABLE {tabla} ADD COLUMN capital_asignado REAL")
         except Exception:
@@ -341,7 +370,7 @@ def _crear_tabla_simulaciones(cur):
     # retroactivo: usa el capital_dia real de CADA fecha (tabla
     # capital_diario) × 5%, el mismo cálculo que se usa para las
     # nuevas.
-    for tabla in ("simulaciones", "simulaciones_directivas", "simulaciones_combo", "simulaciones_fix28_fiel", "simulaciones_v5_fiel"):
+    for tabla in ("simulaciones", "simulaciones_directivas", "simulaciones_combo", "simulaciones_fix28_fiel", "simulaciones_v5_fiel", "simulaciones_v55"):
         cur.execute(f"""
             UPDATE {tabla}
             SET capital_asignado = (
@@ -534,6 +563,59 @@ def cerrar_simulacion_v5_fiel(sim_id: int, resultado_pct: float, motivo: str):
     conn.commit()
     conn.close()
 
+
+# ── 24/09 — Directiva V5.5 ("Estrategia Simplificada"): AHORA LA REAL ──
+def par_tiene_simulacion_v55_abierta(par: str) -> bool:
+    conn = _conn()
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM simulaciones_v55 WHERE cerrado = 0 AND par = ?", (par,))
+    n = cur.fetchone()[0]
+    conn.close()
+    return n > 0
+
+
+def crear_simulacion_v55(par, direccion, score, adx, atr_pct, precio_entrada) -> int:
+    conn = _conn()
+    cur = conn.cursor()
+    ahora = datetime.now(TZ_ARG)
+    capital_asignado = _capital_asignado_estimado()
+    cur.execute("""
+        INSERT INTO simulaciones_v55 (par, direccion, score, adx, atr_pct, precio_entrada, capital_asignado, fecha, hora, creado)
+        VALUES (?,?,?,?,?,?,?,?,?,?)
+    """, (par, direccion, score, adx, atr_pct, precio_entrada, capital_asignado, ahora.strftime("%Y%m%d"), ahora.strftime("%H:%M"), ahora.isoformat()))
+    conn.commit()
+    sim_id = cur.lastrowid
+    conn.close()
+    return sim_id
+
+
+def simulaciones_v55_abiertas() -> list:
+    conn = _conn()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM simulaciones_v55 WHERE cerrado = 0")
+    rows = [dict(r) for r in cur.fetchall()]
+    conn.close()
+    return rows
+
+
+def actualizar_pico_simulacion_v55(sim_id: int, pico_nuevo: float):
+    conn = _conn()
+    cur = conn.cursor()
+    cur.execute("UPDATE simulaciones_v55 SET pico_maximo_pct = ? WHERE id = ?", (pico_nuevo, sim_id))
+    conn.commit()
+    conn.close()
+
+
+def cerrar_simulacion_v55(sim_id: int, resultado_pct: float, motivo: str):
+    conn = _conn()
+    cur = conn.cursor()
+    ahora = datetime.now(TZ_ARG)
+    cur.execute("""
+        UPDATE simulaciones_v55 SET cerrado = 1, resultado_pct = ?, motivo_cierre = ?, fecha_cierre = ?, hora_cierre = ?
+        WHERE id = ?
+    """, (resultado_pct, motivo, ahora.strftime("%Y%m%d"), ahora.strftime("%H:%M"), sim_id))
+    conn.commit()
+    conn.close()
 
 
 def par_tiene_simulacion_combo_abierta(par: str) -> bool:
@@ -826,6 +908,34 @@ def contar_aperturas_ultimos_minutos(minutos: int = 15) -> int:
     limite = (datetime.now(TZ_ARG) - timedelta(minutes=minutos)).isoformat()
     cur.execute("""
         SELECT COUNT(*) FROM senales WHERE bu_order_id IS NOT NULL AND creado >= ?
+    """, (limite,))
+    n = cur.fetchone()[0]
+    conn.close()
+    return n
+
+
+def contar_simulaciones_v55_abiertas() -> int:
+    """
+    24/09 — Directiva V5.5: equivalente de contar_posiciones_abiertas()
+    pero para la tabla de simulación, para que el tope de 6 simultáneas
+    quede reflejado en la sombra también cuando el bot está pausado (o
+    simplemente no tiene lugar en la tabla real todavía).
+    """
+    conn = _conn()
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM simulaciones_v55 WHERE cerrado = 0")
+    n = cur.fetchone()[0]
+    conn.close()
+    return n
+
+
+def contar_aperturas_v55_ultimos_minutos(minutos: int = 15) -> int:
+    """Equivalente de contar_aperturas_ultimos_minutos() para simulaciones_v55 (tope de 2 por ciclo de 15min)."""
+    conn = _conn()
+    cur = conn.cursor()
+    limite = (datetime.now(TZ_ARG) - timedelta(minutes=minutos)).isoformat()
+    cur.execute("""
+        SELECT COUNT(*) FROM simulaciones_v55 WHERE creado >= ?
     """, (limite,))
     n = cur.fetchone()[0]
     conn.close()

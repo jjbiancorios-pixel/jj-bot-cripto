@@ -258,6 +258,44 @@ def evaluar_cierre_v5(direccion: str, pico_maximo_pct: float, resultado_actual_p
     return {"cerrar": False, "motivo": None, "pico_nuevo": pico_actual}
 
 
+# ── 24/09 — Directiva V5.5 ("Estrategia Simplificada"): AHORA LA REAL,
+# reemplaza a V5.0 en el capital de verdad (V5.0 pasa a modo sombra
+# exclusivo desde acá). Objetivo declarado por Juanjo: resolver el
+# "problema de asfixia por Stop Loss corto" que venía mostrando V5.0 en
+# producción (-4,5% con trailing muy ajustado, cerrando en pérdida antes
+# de que la posición pudiera desarrollarse).
+#
+# "OXÍGENO OPERATIVO (10x)": el -25,0% apalancado de acá corresponde a un
+# leverage de 10x — que es exactamente LEVERAGE_FIJO ya vigente en este
+# archivo (línea de arriba), así que no hace falta ningún cambio de
+# apalancamiento real: -25,0%/10 = -2,5% de movimiento real del precio,
+# tal cual lo pidió la directiva.
+SL_V55_PCT = -25.0  # apalancado (10x) = -2.5% de movimiento real de precio
+PICO_ACTIVACION_V55_PCT = 5.0  # apalancado (10x) = +0.5% de movimiento real
+RETROCESO_V55_PCT = 10  # fijo, un solo tramo — igual patrón que V5.0/Directivas
+
+
+def evaluar_cierre_v55(direccion: str, pico_maximo_pct: float, resultado_actual_pct: float) -> dict:
+    """
+    24/09 — Directiva V5.5 ("Estrategia Simplificada"): SL fijo -25,0%
+    apalancado (10x => -2,5% real), trailing de un solo tramo (activa en
+    pico≥5,0% apalancado => +0,5% real, retrocede 10% fijo desde el
+    pico). Misma estructura que evaluar_cierre_v5/evaluar_cierre_directivas
+    (SL + 1 tramo de trailing fijo), solo que con el SL mucho más ancho
+    para evitar el "whipsaw" que venía mostrando V5.0 con su SL -4,5%.
+    """
+    if resultado_actual_pct <= SL_V55_PCT:
+        return {"cerrar": True, "motivo": "stop_loss", "pico_nuevo": pico_maximo_pct}
+
+    pico_actual = max(pico_maximo_pct or 0, resultado_actual_pct)
+    if pico_actual >= PICO_ACTIVACION_V55_PCT:
+        piso_permitido = pico_actual * (1 - RETROCESO_V55_PCT / 100)
+        if resultado_actual_pct <= piso_permitido:
+            return {"cerrar": True, "motivo": "trailing_v55", "pico_nuevo": pico_actual}
+
+    return {"cerrar": False, "motivo": None, "pico_nuevo": pico_actual}
+
+
 def evaluar_cierre_fix28_fiel(direccion: str, atr_pct: float, pico_maximo_pct: float, resultado_actual_pct: float,
                                precio_actual: float = None, rango_bajo: float = None, rango_alto: float = None,
                                fuera_rango_desde: str = None, btc_estado: str = None) -> dict:
@@ -334,6 +372,26 @@ def hay_lugar_para_abrir() -> dict:
         return {"hay_lugar": False, "motivo": f"tope de {MAX_POSICIONES_SIMULTANEAS} posiciones simultáneas"}
 
     aperturas_recientes = db.contar_aperturas_ultimos_minutos(15)
+    if aperturas_recientes >= MAX_APERTURAS_POR_CICLO:
+        return {"hay_lugar": False, "motivo": f"tope de {MAX_APERTURAS_POR_CICLO} aperturas cada 15 min"}
+
+    return {"hay_lugar": True, "motivo": None}
+
+
+def hay_lugar_para_abrir_v55() -> dict:
+    """
+    24/09 — Directiva V5.5: mismo chequeo que hay_lugar_para_abrir(), pero
+    contra la tabla de simulación (simulaciones_v55) en vez de la real —
+    para que la sombra de V5.5 refleje fielmente el mismo límite de 6
+    posiciones simultáneas y 2 aperturas por ciclo de 15min que tendría
+    si operara con capital real, incluso con el bot pausado (donde la
+    tabla real no tiene ninguna posición contra la cual medir el tope).
+    """
+    abiertas = db.contar_simulaciones_v55_abiertas()
+    if abiertas >= MAX_POSICIONES_SIMULTANEAS:
+        return {"hay_lugar": False, "motivo": f"tope de {MAX_POSICIONES_SIMULTANEAS} posiciones simultáneas"}
+
+    aperturas_recientes = db.contar_aperturas_v55_ultimos_minutos(15)
     if aperturas_recientes >= MAX_APERTURAS_POR_CICLO:
         return {"hay_lugar": False, "motivo": f"tope de {MAX_APERTURAS_POR_CICLO} aperturas cada 15 min"}
 

@@ -403,15 +403,20 @@ def _cmd_comparar(args: list) -> str:
                 f"<b>neto real: {ponderado_txt}</b> (suma simple: {r['resultado_neto_pct']:+.2f}%)")
 
     r_real = db.resumen_ponderado("senales", desde_fecha, hasta_fecha)
+    r_v55 = db.resumen_ponderado("simulaciones_v55", desde_fecha, hasta_fecha)
     r_v5_fiel = db.resumen_ponderado("simulaciones_v5_fiel", desde_fecha, hasta_fecha)
     r_fiel = db.resumen_ponderado("simulaciones_fix28_fiel", desde_fecha, hasta_fecha)
     r_sim = db.resumen_ponderado("simulaciones", desde_fecha, hasta_fecha)
     r_dir = db.resumen_ponderado("simulaciones_directivas", desde_fecha, hasta_fecha)
     r_combo = db.resumen_ponderado("simulaciones_combo", desde_fecha, hasta_fecha)
 
+    # 24/09 — Directiva V5.5 ("Estrategia Simplificada") reemplaza a V5.0
+    # como la que opera con capital real; V5.0 pasa a sombra exclusiva
+    # junto con el resto. "Real" de acá en más se refiere a V5.5.
     return (f"📊 <b>Comparación de estrategias — {etiqueta}</b>\n\n"
-            f"🔴 Real, con capital de verdad (V5.0): {_fmt(r_real)}\n\n"
-            f"👻 V5.0 fiel — qué hubiera pasado sin pausa: {_fmt(r_v5_fiel)}\n\n"
+            f"🔴 Real, con capital de verdad (V5.5): {_fmt(r_real)}\n\n"
+            f"👻 V5.5 fiel — qué hubiera pasado sin pausa: {_fmt(r_v55)}\n\n"
+            f"👻 V5.0 fiel (en sombra desde 24/09): {_fmt(r_v5_fiel)}\n\n"
             f"📜 fix28 (histórica, comparación): {_fmt(r_fiel)}\n\n"
             f"🧪 Simulación original: {_fmt(r_sim)}\n\n"
             f"📐 Directivas: {_fmt(r_dir)}\n\n"
@@ -522,8 +527,8 @@ def procesar_comando(texto: str) -> str:
             "/gates PAR [fix28|v5] — últimos 10 chequeos de gates para un par (diagnóstico)\n"
             "/informe [FECHA|todo] — informe completo para análisis: ganadoras/perdedoras, "
             "promedios, neto, por motivo, score, selectividad. Ej: /informe todo\n"
-            "/comparar [FECHA [FECHA_HASTA]|todo] — las 6 estrategias juntas (real V5.0, "
-            "V5.0 fiel, fix28 histórica, simulación original, Directivas, Combo)\n"
+            "/comparar [FECHA [FECHA_HASTA]|todo] — las 7 estrategias juntas (real V5.5, "
+            "V5.5 fiel, V5.0 fiel [sombra], fix28 histórica, simulación original, Directivas, Combo)\n"
             "/simulaciones [FECHA|todo] — resultados de la simulación original (sin capital real)\n"
             "/directivas [FECHA|todo] — resultados de la simulación Directivas (sin capital real)\n"
             "/diagnostico_apertura — prueba el flujo de apertura real con checkParams de Pionex, sin abrir nada\n"
