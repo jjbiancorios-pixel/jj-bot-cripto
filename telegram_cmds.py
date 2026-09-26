@@ -516,6 +516,144 @@ def _cmd_seguimiento_v55(args: list) -> str:
     return "\n".join(lineas)
 
 
+def _cmd_candidatos_v55() -> str:
+    """
+    26/09 — Directiva: verificación rápida del registro completo de
+    candidatos_v55_ciclo (ejecutados y descartados) que ahora se
+    persiste en cada ciclo, justo antes del recorte a los 2 mejores.
+    Muestra el ranking completo del ÚLTIMO ciclo evaluado.
+    """
+    filas = db.ultimo_ciclo_v55_candidatos()
+    if not filas:
+        return "Todavía no hay candidatos_v55_ciclo registrados (recién desplegado, esperá al próximo ciclo de 15min)."
+
+    lineas = [f"📋 <b>Candidatos V5.5 — último ciclo</b> ({filas[0]['fecha']} {filas[0]['hora']}, {len(filas)} calificados)"]
+    for f in filas:
+        marca = "✅" if f["ejecutado"] else "▫️"
+        rsi = f.get("rsi_15m")
+        score = f.get("score")
+        rsi_txt = f"{rsi:.1f}" if rsi is not None else "s/d"
+        score_txt = f"{score:.2f}" if score is not None else "s/d"
+        lineas.append(f"{marca} #{f['posicion']} {f['par']} {f['direccion']} — RSI(15m) {rsi_txt}, score {score_txt}")
+    return "\n".join(lineas)
+
+
+def _cmd_informe_candidatos(args: list) -> str:
+    """
+    26/09 — Directiva: cantidad y calidad de candidatos de V5.5 por
+    posición del ranking (ejecutados pos 1-2 vs descartados pos 3,
+    4, 5-10), usando el seguimiento de 12hs. Sirve para evaluar si
+    conviene abrir 3 o 4 por ciclo en vez de 2, ANTES de tocar nada
+    del bot real.
+
+    Mismo parseo de fechas que /comparar: [FECHA [FECHA_HASTA]|todo].
+    """
+    desde_fecha, hasta_fecha = None, None
+    if args and args[0].lower() != "todo":
+        desde_fecha = args[0]
+        if len(args) >= 2:
+            hasta_fecha = args[1]
+    elif args and args[0].lower() == "todo" and len(args) >= 2:
+        desde_fecha = args[1]
+        if len(args) >= 3:
+            hasta_fecha = args[2]
+
+    if desde_fecha is None:
+        etiqueta = "TODO EL HISTORIAL"
+    elif hasta_fecha:
+        etiqueta = f"{desde_fecha} a {hasta_fecha}"
+    else:
+        etiqueta = desde_fecha
+
+    resumen = db.informe_candidatos_v55(desde_fecha, hasta_fecha)
+    if resumen.get("n_ciclos", 0) == 0:
+        return f"Sin candidatos_v55_ciclo registrados para {etiqueta} todavía."
+
+    lineas = [
+        f"📊 <b>Calidad de candidatos V5.5 — {etiqueta}</b>",
+        f"Ciclos: {resumen['n_ciclos']} — candidatos totales: {resumen['total_candidatos']} "
+        f"(prom {resumen['promedio_por_ciclo']}/ciclo)",
+        "",
+        "Por posición en el ranking (cierres reales ya simulados):",
+    ]
+    for nombre, d in resumen["por_posicion"].items():
+        if d.get("n_cerradas", 0) > 0:
+            lineas.append(
+                f"• {nombre}: {d['n_cerradas']} cerradas — "
+                f"win rate {d['win_rate_pct']}%, resultado prom {d['resultado_prom_pct']:+.2f}%"
+            )
+        else:
+            lineas.append(f"• {nombre}: sin cierres todavía")
+    lineas.append("")
+    lineas.append(
+        "ℹ️ Calidad real por posición del ranking — cierres simulados con la MISMA lógica de "
+        "salida que la real (SL -25%/trailing). Para ver si conviene N por ciclo con un tope "
+        "M específico, usá /informe_combo N M."
+    )
+    return "\n".join(lineas)
+
+
+def _cmd_informe_combo(args: list) -> str:
+    """
+    26/09 — Directiva (v2): backtest retroactivo REAL de una combinación
+    "N aperturas por ciclo / M tope simultáneo", usando los cierres de
+    sombra_ranked_v55 (simulados con la MISMA lógica de salida que la
+    real: SL -25% apalancado / trailing) — no una aproximación por
+    precio a horas fijas. Uso: /informe_combo N M [FECHA [FECHA_HASTA]|todo]
+    Ej: /informe_combo 4 6  →  4 por ciclo, tope 6 simultáneas, todo el historial
+    """
+    if len(args) < 2:
+        return ("Uso: /informe_combo N M [FECHA [FECHA_HASTA]|todo]\n"
+                "N = aperturas por ciclo, M = tope de posiciones simultáneas.\n"
+                "Ej: /informe_combo 4 6")
+    try:
+        n = int(args[0])
+        m = int(args[1])
+    except ValueError:
+        return "N y M deben ser números enteros. Uso: /informe_combo N M [FECHA [FECHA_HASTA]|todo]"
+    if n < 1 or m < 1:
+        return "N y M deben ser mayores a 0."
+    if n > db.TOP_SOMBRA_RANKED_V55:
+        return f"N no puede ser mayor a {db.TOP_SOMBRA_RANKED_V55} (solo se simula continuamente hasta esa posición del ranking)."
+
+    resto = args[2:]
+    desde_fecha, hasta_fecha = None, None
+    if resto and resto[0].lower() != "todo":
+        desde_fecha = resto[0]
+        if len(resto) >= 2:
+            hasta_fecha = resto[1]
+    elif resto and resto[0].lower() == "todo" and len(resto) >= 2:
+        desde_fecha = resto[1]
+        if len(resto) >= 3:
+            hasta_fecha = resto[2]
+
+    if desde_fecha is None:
+        etiqueta = "TODO EL HISTORIAL"
+    elif hasta_fecha:
+        etiqueta = f"{desde_fecha} a {hasta_fecha}"
+    else:
+        etiqueta = desde_fecha
+
+    r = db.informe_combo_v55(n, m, desde_fecha, hasta_fecha)
+    if r.get("n_candidatos", 0) == 0:
+        return (f"Sin cierres de sombra_ranked_v55 (posición ≤ {n}) para {etiqueta} todavía — "
+                f"hace falta acumular historial primero después de subir este fix.")
+    if r.get("n_aceptadas", 0) == 0:
+        return f"{r['n_candidatos']} candidatos evaluados (pos ≤ {n}) pero ninguno hubiera entrado con tope {m} (todos bloqueados)."
+
+    ponderado = r.get("neto_ponderado_pct")
+    ponderado_txt = f"{ponderado:+.2f}%" if ponderado is not None else "s/d (falta capital de hoy)"
+    return (
+        f"🧮 <b>Combo V5.5 — {n} por ciclo / tope {m}</b> ({etiqueta})\n\n"
+        f"Candidatos evaluados (pos ≤ {n}): {r['n_candidatos']}\n"
+        f"Hubieran abierto: {r['n_aceptadas']} | bloqueadas por el tope: {r['n_bloqueadas_tope']}\n"
+        f"✅ {r['n_ganadoras']} | ❌ {r['n_perdedoras']} | win rate {r['win_rate_pct']}%\n"
+        f"<b>Neto real: {ponderado_txt}</b> (suma simple: {r['resultado_neto_pct']:+.2f}%)\n\n"
+        f"Basado en cierres simulados con la MISMA lógica de salida real (SL -25%/trailing) — "
+        f"no una aproximación por checkpoints de precio."
+    )
+
+
 def _cmd_gates(args: list) -> str:
     if not args:
         return "Uso: /gates PAR [fix28|v5]\nEj: /gates BTC v5"
@@ -603,6 +741,12 @@ def procesar_comando(texto: str) -> str:
         return _cmd_detalle_v55(args)
     elif cmd == "/seguimiento_v55":
         return _cmd_seguimiento_v55(args)
+    elif cmd == "/candidatos_v55":
+        return _cmd_candidatos_v55()
+    elif cmd == "/informe_candidatos":
+        return _cmd_informe_candidatos(args)
+    elif cmd == "/informe_combo":
+        return _cmd_informe_combo(args)
     elif cmd == "/simulaciones":
         return _cmd_simulaciones(args)
     elif cmd == "/directivas":
@@ -627,6 +771,13 @@ def procesar_comando(texto: str) -> str:
             "/seguimiento_v55 [sl] [N] — cómo siguió cotizando cada par 12hs después del cierre de "
             "V5.5 fiel (checkpoints 1/2/4/6/8/12hs). \"sl\" filtra solo las que cerraron por stop_loss "
             "(sin corchetes al escribir el número). Ej: /seguimiento_v55 sl 20\n"
+            "/candidatos_v55 — ranking completo del último ciclo de V5.5 (ejecutados ✅ y "
+            "descartados ▫️), con RSI(15m) y score\n"
+            "/informe_candidatos [FECHA [FECHA_HASTA]|todo] — calidad real de candidatos por "
+            "posición del ranking (ejecutadas vs descartadas), con cierres simulados de verdad\n"
+            "/informe_combo N M [FECHA [FECHA_HASTA]|todo] — backtest retroactivo REAL de abrir N "
+            "por ciclo con tope M simultáneas (usa la misma lógica de salida que la real). "
+            "Ej: /informe_combo 4 6\n"
             "/informe [FECHA|todo] — informe completo para análisis: ganadoras/perdedoras, "
             "promedios, neto, por motivo, score, selectividad. Ej: /informe todo\n"
             "/comparar [FECHA [FECHA_HASTA]|todo] — las 7 estrategias juntas (real V5.5, "

@@ -157,6 +157,8 @@ def init_db():
 
     _migrar_columnas_nuevas(cur)
     _crear_tabla_simulaciones(cur)
+    _crear_tabla_candidatos_v55_ciclo(cur)
+    _crear_tabla_sombra_ranked_v55(cur)
 
     conn.commit()
     conn.close()
@@ -423,6 +425,381 @@ def _crear_tabla_simulaciones(cur):
             )
             WHERE capital_asignado IS NULL
         """)
+
+
+# ── 26/09 — Directiva: registro del LOTE COMPLETO de candidatos de
+# V5.5 en cada ciclo (ejecutados y descartados), capturado justo antes
+# del recorte a los 2 mejores. Objetivo: poder medir después cantidad
+# y calidad de las señales que no llegaron a simularse, para evaluar
+# si conviene abrir más de 2 por ciclo.
+def _crear_tabla_candidatos_v55_ciclo(cur):
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS candidatos_v55_ciclo (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ciclo_ts TEXT NOT NULL,
+            fecha TEXT NOT NULL,
+            hora TEXT NOT NULL,
+            par TEXT NOT NULL,
+            direccion TEXT NOT NULL,
+            rsi_15m REAL,
+            score REAL,
+            posicion INTEGER NOT NULL,
+            ejecutado INTEGER DEFAULT 0,
+            precio REAL,
+            creado TEXT NOT NULL
+        )
+    """)
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_candidatos_v55_ciclo_fecha ON candidatos_v55_ciclo (fecha)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_candidatos_v55_ciclo_ciclo_ts ON candidatos_v55_ciclo (ciclo_ts)")
+
+    # 26/09 — Columnas de seguimiento por checkpoints fijos (1/2/4/6/8/12hs),
+    # SUPERADAS por sombra_ranked_v55 (simulación continua con la lógica de
+    # salida real) más abajo — se dejan acá solo para no romper una base ya
+    # migrada con este esquema, no se usan más activamente.
+    columnas_seguimiento = [
+        ("seguimiento_activo", "INTEGER DEFAULT 0"),
+        ("terminado", "INTEGER DEFAULT 0"),
+        ("precio_1h", "REAL"), ("resultado_1h_pct", "REAL"),
+        ("precio_2h", "REAL"), ("resultado_2h_pct", "REAL"),
+        ("precio_4h", "REAL"), ("resultado_4h_pct", "REAL"),
+        ("precio_6h", "REAL"), ("resultado_6h_pct", "REAL"),
+        ("precio_8h", "REAL"), ("resultado_8h_pct", "REAL"),
+        ("precio_12h", "REAL"), ("resultado_12h_pct", "REAL"),
+    ]
+    for nombre, tipo in columnas_seguimiento:
+        try:
+            cur.execute(f"ALTER TABLE candidatos_v55_ciclo ADD COLUMN {nombre} {tipo}")
+        except Exception:
+            pass  # ya existe
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_candidatos_v55_ciclo_seguimiento ON candidatos_v55_ciclo (seguimiento_activo, terminado)")
+
+
+TOP_SEGUIMIENTO_V55_CICLO = 10  # cuántos candidatos por ciclo (de arriba hacia abajo) reciben seguimiento de 12hs
+
+
+def guardar_candidatos_v55_ciclo(candidatos_ordenados: list):
+    """
+    26/09 — Persistencia MASIVA (executemany, una sola vuelta a la DB)
+    del ranking completo de un ciclo, ya ordenado de mejor a peor.
+    `posicion` = 1-based según el orden recibido. `ejecutado` = 1 para
+    los que quedaron en el top-2 (los que pasan a simularse/abrir),
+    0 para el resto (descartados por el tope de 2 por ciclo).
+
+    Nota: `ejecutado` refleja el corte del ranking, no si la simulación
+    finalmente se creó — un candidato del top-2 puede igual no llegar a
+    simularse si `hay_lugar_para_abrir_v55()` no tiene lugar (tope de 6
+    simultáneas). Esa distinción no está contemplada acá todavía.
+    """
+    if not candidatos_ordenados:
+        return
+    conn = _conn()
+    cur = conn.cursor()
+    ahora = datetime.now(TZ_ARG)
+    ciclo_ts = ahora.isoformat()
+    fecha = ahora.strftime("%Y%m%d")
+    hora = ahora.strftime("%H:%M")
+    filas = [
+        (
+            ciclo_ts, fecha, hora,
+            c.get("par"), c.get("direccion"), c.get("rsi_15m"), c.get("fuerza_score_v55"),
+            i, 1 if i <= 2 else 0, c.get("precio"),
+            1 if i <= TOP_SEGUIMIENTO_V55_CICLO else 0, ciclo_ts,
+        )
+        for i, c in enumerate(candidatos_ordenados, start=1)
+    ]
+    cur.executemany("""
+        INSERT INTO candidatos_v55_ciclo
+            (ciclo_ts, fecha, hora, par, direccion, rsi_15m, score, posicion, ejecutado, precio, seguimiento_activo, creado)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+    """, filas)
+    conn.commit()
+    conn.close()
+
+
+# ── 26/09 — Directiva (v2): reemplaza el seguimiento por checkpoints
+# fijos de arriba — Juanjo pidió que el informe diga de verdad "qué
+# hubiera pasado", no una aproximación por precio a horas fijas. Para
+# eso, los candidatos de posición 1..TOP_SOMBRA_RANKED_V55 de cada
+# ciclo se simulan CONTINUAMENTE (cada 2seg, mismo hilo que
+# simulaciones_v55) con la MISMA lógica de salida real
+# (gestion_riesgo.evaluar_cierre_v55: SL -25% apalancado / trailing por
+# pico) — no son 6 fotos de precio, es la posición completa abierta y
+# cerrada con la lógica real. Esto permite backtestear en retrospectiva
+# CUALQUIER combinación de "N aperturas por ciclo / M tope simultáneo"
+# con datos reales de fidelidad completa, no una suposición.
+TOP_SOMBRA_RANKED_V55 = 10  # hasta qué posición del ranking se simula continuamente
+
+
+def _crear_tabla_sombra_ranked_v55(cur):
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS sombra_ranked_v55 (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ciclo_ts TEXT NOT NULL,
+            fecha TEXT NOT NULL,
+            hora TEXT NOT NULL,
+            par TEXT NOT NULL,
+            direccion TEXT NOT NULL,
+            posicion INTEGER NOT NULL,
+            score REAL,
+            rsi_15m REAL,
+            precio_entrada REAL,
+            pico_maximo_pct REAL DEFAULT 0,
+            capital_asignado REAL,
+            cerrado INTEGER DEFAULT 0,
+            resultado_pct REAL,
+            motivo_cierre TEXT,
+            fecha_cierre TEXT,
+            hora_cierre TEXT,
+            creado TEXT NOT NULL
+        )
+    """)
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_sombra_ranked_v55_par_cerrado ON sombra_ranked_v55 (par, cerrado)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_sombra_ranked_v55_fecha ON sombra_ranked_v55 (fecha)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_sombra_ranked_v55_posicion ON sombra_ranked_v55 (posicion)")
+
+
+def par_tiene_sombra_ranked_v55_abierta(par: str) -> bool:
+    conn = _conn()
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM sombra_ranked_v55 WHERE cerrado = 0 AND par = ?", (par,))
+    n = cur.fetchone()[0]
+    conn.close()
+    return n > 0
+
+
+def abrir_sombra_ranked_v55_lote(candidatos_ordenados: list, top: int = TOP_SOMBRA_RANKED_V55):
+    """
+    Abre (si el par no tiene ya una abierta) una posición de sombra
+    continua para cada candidato de posición 1..top del ciclo. Cada una
+    se evalúa después con la MISMA evaluar_cierre_v55 que la real y que
+    simulaciones_v55, en el hilo de 2seg (ver sombra_ranked_v55_abiertas).
+    """
+    if not candidatos_ordenados:
+        return
+    conn = _conn()
+    cur = conn.cursor()
+    ahora = datetime.now(TZ_ARG)
+    ciclo_ts = ahora.isoformat()
+    fecha = ahora.strftime("%Y%m%d")
+    hora = ahora.strftime("%H:%M")
+    capital_asignado = _capital_asignado_estimado()
+    filas = []
+    for i, c in enumerate(candidatos_ordenados[:top], start=1):
+        par = c.get("par")
+        if par_tiene_sombra_ranked_v55_abierta(par):
+            continue
+        filas.append((
+            ciclo_ts, fecha, hora, par, c.get("direccion"), i,
+            c.get("fuerza_score_v55"), c.get("rsi_15m"), c.get("precio"), capital_asignado, ciclo_ts,
+        ))
+    if filas:
+        cur.executemany("""
+            INSERT INTO sombra_ranked_v55
+                (ciclo_ts, fecha, hora, par, direccion, posicion, score, rsi_15m, precio_entrada, capital_asignado, creado)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?)
+        """, filas)
+        conn.commit()
+    conn.close()
+
+
+def sombra_ranked_v55_abiertas() -> list:
+    conn = _conn()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM sombra_ranked_v55 WHERE cerrado = 0")
+    rows = [dict(r) for r in cur.fetchall()]
+    conn.close()
+    return rows
+
+
+def actualizar_pico_sombra_ranked_v55(id_: int, pico_nuevo: float):
+    conn = _conn()
+    cur = conn.cursor()
+    cur.execute("UPDATE sombra_ranked_v55 SET pico_maximo_pct = ? WHERE id = ?", (pico_nuevo, id_))
+    conn.commit()
+    conn.close()
+
+
+def cerrar_sombra_ranked_v55(id_: int, resultado_pct: float, motivo: str):
+    conn = _conn()
+    cur = conn.cursor()
+    ahora = datetime.now(TZ_ARG)
+    cur.execute("""
+        UPDATE sombra_ranked_v55 SET cerrado = 1, resultado_pct = ?, motivo_cierre = ?, fecha_cierre = ?, hora_cierre = ?
+        WHERE id = ?
+    """, (resultado_pct, motivo, ahora.strftime("%Y%m%d"), ahora.strftime("%H:%M"), id_))
+    conn.commit()
+    conn.close()
+
+
+def informe_candidatos_v55(desde_fecha: str = None, hasta_fecha: str = None) -> dict:
+    """
+    26/09 — Cantidad y calidad REAL de candidatos por posición del
+    ranking, usando los cierres YA SIMULADOS de sombra_ranked_v55 (con
+    la lógica de salida real, no una aproximación por precio a horas
+    fijas). Cuenta también cuántos candidatos calificaron en total por
+    ciclo (tabla candidatos_v55_ciclo, todas las posiciones).
+    """
+    conn = _conn()
+    cur = conn.cursor()
+
+    query_c = "SELECT ciclo_ts, posicion FROM candidatos_v55_ciclo WHERE 1=1"
+    params_c = []
+    if desde_fecha:
+        query_c += " AND fecha >= ?"
+        params_c.append(desde_fecha)
+    if hasta_fecha:
+        query_c += " AND fecha <= ?"
+        params_c.append(hasta_fecha)
+    cur.execute(query_c, tuple(params_c))
+    filas_candidatos = cur.fetchall()
+
+    query_s = "SELECT * FROM sombra_ranked_v55 WHERE cerrado = 1 AND resultado_pct IS NOT NULL"
+    params_s = []
+    if desde_fecha:
+        query_s += " AND fecha >= ?"
+        params_s.append(desde_fecha)
+    if hasta_fecha:
+        query_s += " AND fecha <= ?"
+        params_s.append(hasta_fecha)
+    cur.execute(query_s, tuple(params_s))
+    filas_sombra = [dict(r) for r in cur.fetchall()]
+    conn.close()
+
+    if not filas_candidatos:
+        return {"n_ciclos": 0}
+
+    n_ciclos = len(set(r[0] for r in filas_candidatos))
+    total = len(filas_candidatos)
+
+    buckets = [
+        ("pos_1_2 (ejecutadas)", lambda p: p <= 2),
+        ("pos_3", lambda p: p == 3),
+        ("pos_4", lambda p: p == 4),
+        ("pos_5_10", lambda p: 5 <= p <= 10),
+    ]
+
+    detalle = {}
+    for nombre, cond in buckets:
+        cerradas = [f for f in filas_sombra if cond(f["posicion"])]
+        if cerradas:
+            ganadoras = [f for f in cerradas if f["resultado_pct"] > 0]
+            detalle[nombre] = {
+                "n_cerradas": len(cerradas),
+                "win_rate_pct": round(len(ganadoras) / len(cerradas) * 100, 1),
+                "resultado_prom_pct": round(sum(f["resultado_pct"] for f in cerradas) / len(cerradas), 2),
+            }
+        else:
+            detalle[nombre] = {"n_cerradas": 0}
+
+    return {
+        "n_ciclos": n_ciclos,
+        "total_candidatos": total,
+        "promedio_por_ciclo": round(total / n_ciclos, 1) if n_ciclos else None,
+        "por_posicion": detalle,
+    }
+
+
+def informe_combo_v55(n: int, m: int, desde_fecha: str = None, hasta_fecha: str = None) -> dict:
+    """
+    26/09 — Backtest retroactivo real: qué hubiera dado abrir hasta `n`
+    candidatos por ciclo (por orden de ranking) con un tope de `m`
+    posiciones simultáneas, reproduciendo cronológicamente los cierres
+    YA SIMULADOS de sombra_ranked_v55 (fidelidad completa: SL -25%
+    apalancado / trailing, igual que la real).
+
+    Algoritmo: recorre los candidatos de posición <= n en orden de
+    apertura; en cada uno, libera del "cupo" ocupado las posiciones que
+    ya habrían cerrado para esa fecha/hora; si hay lugar (menos de m
+    ocupadas Y el par no tiene ya una ocupada) lo acepta, si no lo
+    cuenta como bloqueado por el tope — mismo criterio que
+    hay_lugar_para_abrir_v55(), aplicado en retrospectiva.
+    """
+    conn = _conn()
+    cur = conn.cursor()
+    query = "SELECT * FROM sombra_ranked_v55 WHERE posicion <= ? AND cerrado = 1 AND resultado_pct IS NOT NULL"
+    params = [n]
+    if desde_fecha:
+        query += " AND fecha >= ?"
+        params.append(desde_fecha)
+    if hasta_fecha:
+        query += " AND fecha <= ?"
+        params.append(hasta_fecha)
+    query += " ORDER BY ciclo_ts ASC"
+    cur.execute(query, tuple(params))
+    filas = [dict(r) for r in cur.fetchall()]
+    conn.close()
+
+    if not filas:
+        return {"n_candidatos": 0}
+
+    ocupadas = []  # [(par, cierre_dt_o_None)]
+    aceptadas = []
+    bloqueadas_tope = 0
+
+    for f in filas:
+        try:
+            apertura_dt = datetime.fromisoformat(f["ciclo_ts"])
+        except Exception:
+            continue
+        cierre_dt = None
+        if f.get("fecha_cierre") and f.get("hora_cierre"):
+            try:
+                cierre_dt = datetime.strptime(f"{f['fecha_cierre']} {f['hora_cierre']}", "%Y%m%d %H:%M").replace(tzinfo=TZ_ARG)
+            except Exception:
+                cierre_dt = None
+
+        ocupadas = [(p, c) for (p, c) in ocupadas if c is None or c > apertura_dt]
+        par_ocupado = any(p == f["par"] for p, c in ocupadas)
+        if par_ocupado or len(ocupadas) >= m:
+            bloqueadas_tope += 1
+            continue
+        ocupadas.append((f["par"], cierre_dt))
+        aceptadas.append(f)
+
+    if not aceptadas:
+        return {"n_candidatos": len(filas), "n_aceptadas": 0, "n_bloqueadas_tope": bloqueadas_tope}
+
+    cap_hoy = obtener_capital_diario()
+    capital_total = cap_hoy["capital_dia"] if cap_hoy else None
+    if capital_total is None:
+        conn2 = _conn()
+        cur2 = conn2.cursor()
+        cur2.execute("SELECT capital_dia FROM capital_diario ORDER BY fecha DESC LIMIT 1")
+        row2 = cur2.fetchone()
+        conn2.close()
+        capital_total = row2[0] if row2 else None
+
+    ganadoras = [f for f in aceptadas if f["resultado_pct"] > 0]
+    ganancia_usd = sum((f["resultado_pct"] / 100) * (f.get("capital_asignado") or 0) for f in aceptadas)
+    neto_ponderado_pct = round((ganancia_usd / capital_total) * 100, 2) if capital_total else None
+
+    return {
+        "n_candidatos": len(filas),
+        "n_aceptadas": len(aceptadas),
+        "n_bloqueadas_tope": bloqueadas_tope,
+        "n_ganadoras": len(ganadoras),
+        "n_perdedoras": len(aceptadas) - len(ganadoras),
+        "win_rate_pct": round(len(ganadoras) / len(aceptadas) * 100, 1),
+        "resultado_neto_pct": round(sum(f["resultado_pct"] for f in aceptadas), 2),
+        "ganancia_usd": round(ganancia_usd, 2),
+        "neto_ponderado_pct": neto_ponderado_pct,
+    }
+
+
+def ultimo_ciclo_v55_candidatos() -> list:
+    """26/09 — El ranking completo del ciclo más reciente ya persistido, ordenado por posición. Para verificar el registro tras el deploy."""
+    conn = _conn()
+    cur = conn.cursor()
+    cur.execute("SELECT MAX(ciclo_ts) FROM candidatos_v55_ciclo")
+    row = cur.fetchone()
+    ciclo_ts = row[0] if row else None
+    if not ciclo_ts:
+        conn.close()
+        return []
+    cur.execute("SELECT * FROM candidatos_v55_ciclo WHERE ciclo_ts = ? ORDER BY posicion ASC", (ciclo_ts,))
+    rows = [dict(r) for r in cur.fetchall()]
+    conn.close()
+    return rows
 
 
 def _capital_asignado_estimado() -> float:

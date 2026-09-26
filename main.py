@@ -325,6 +325,28 @@ def aplicar_ranking_v55(candidatos_calificados_ciclo: list) -> list:
             par_info["fuerza_score_v55"] = rsi_15m - 55.0
 
     candidatos_ordenados = sorted(candidatos_calificados_ciclo, key=lambda x: x.get("fuerza_score_v55", -999.0), reverse=True)
+
+    # 26/09 — Directiva: capturar el LOTE COMPLETO del ciclo (ejecutados
+    # y descartados) justo ACÁ, antes del recorte a los 2 mejores, y
+    # persistirlo en SQLite de forma masiva. Esto es lo único que
+    # permite ver después cantidad y calidad de las señales que
+    # calificaron pero no llegaron a simularse.
+    try:
+        db.guardar_candidatos_v55_ciclo(candidatos_ordenados)
+    except Exception as e:
+        print(f"Error guardando candidatos_v55_ciclo: {e}")
+
+    # 26/09 — Directiva (v2): abre sombra continua (no capital real, sin
+    # tope) para los primeros TOP_SOMBRA_RANKED_V55 del ranking — se
+    # evalúan con la MISMA lógica de salida real (evaluar_cierre_v55) en
+    # el hilo de 2seg, para poder backtestear después CUALQUIER
+    # combinación de aperturas/tope con resultados reales, no una
+    # aproximación por precio a horas fijas.
+    try:
+        db.abrir_sombra_ranked_v55_lote(candidatos_ordenados)
+    except Exception as e:
+        print(f"Error abriendo sombra_ranked_v55: {e}")
+
     return candidatos_ordenados[:2]
 
 
@@ -1261,6 +1283,25 @@ def chequeo_rapido_riesgo():
                                               precio_actual_sim, resultado_actual_sim, decision_sim["motivo"])
                 else:
                     db.actualizar_pico_simulacion_v55(sim["id"], decision_sim["pico_nuevo"])
+
+            # ── 26/09 — Directiva (v2): chequeo de sombra_ranked_v55 —
+            # candidatos de posición 1..TOP_SOMBRA_RANKED_V55 de cada ciclo,
+            # simulados con la MISMA lógica de salida real (evaluar_cierre_v55),
+            # sin tope. Esto es lo que permite backtestear después CUALQUIER
+            # combinación de aperturas/tope con resultados de fidelidad
+            # completa (ver informe_combo_v55 / /informe_combo).
+            for sim in db.sombra_ranked_v55_abiertas():
+                precio_actual_sim = get_precio(sim["par"])
+                if precio_actual_sim is None:
+                    continue
+                cambio_precio_pct = (precio_actual_sim - sim["precio_entrada"]) / sim["precio_entrada"] * 100
+                signo = 1 if sim["direccion"] == "LARGO" else -1
+                resultado_actual_sim = cambio_precio_pct * signo * gestion_riesgo.LEVERAGE_FIJO
+                decision_sim = gestion_riesgo.evaluar_cierre_v55(sim["direccion"], sim["pico_maximo_pct"], resultado_actual_sim)
+                if decision_sim["cerrar"]:
+                    db.cerrar_sombra_ranked_v55(sim["id"], resultado_actual_sim, decision_sim["motivo"])
+                else:
+                    db.actualizar_pico_sombra_ranked_v55(sim["id"], decision_sim["pico_nuevo"])
 
             # ── 25/09: seguimiento post-cierre de V5.5 fiel — registra el precio
             # en checkpoints fijos (1/2/4/6/8/12hs) para cada cierre, sin afectar
