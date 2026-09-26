@@ -18,6 +18,7 @@ import requests
 import os
 from datetime import datetime
 import db
+import gestion_riesgo
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 CHAT_ID = os.environ.get("CHAT_ID", "")
@@ -106,6 +107,24 @@ def _cmd_capital() -> str:
         f"Capital real: USD {cap['capital_dia']:.2f}\n"
         f"Por operación (5%): USD {cap['tamano_objetivo']:.2f}"
     )
+
+
+def _cmd_recalcular_capital() -> str:
+    """
+    26/09 — Fuerza el recálculo de capital del día AHORA (bypassea el
+    chequeo de "ya corrió hoy" y el de "hay posiciones abiertas") y
+    corre el backfill de capital_asignado sobre lo ya guardado hoy.
+    Para usar apenas se detecta que el recálculo de las 00:01 no corrió
+    (bug del 26/09: sin esto, las operaciones de hoy quedan con
+    capital_asignado=NULL y "neto real: s/d" hasta el próximo reinicio).
+    """
+    resultado = gestion_riesgo.intentar_recalculo_diario(forzar=True)
+    if not resultado:
+        return "Sin novedades (no debería pasar con forzar=True)."
+    if resultado.startswith("✅"):
+        db.backfill_capital_asignado()
+        return resultado + "\n\n🔧 Backfill de capital_asignado corrido sobre las operaciones de hoy."
+    return resultado
 
 
 def _cmd_pausar_todo(args: list) -> str:
@@ -399,8 +418,9 @@ def _cmd_comparar(args: list) -> str:
             return "sin cierres todavía"
         ponderado = r.get("neto_ponderado_pct")
         ponderado_txt = f"{ponderado:+.2f}%" if ponderado is not None else "s/d (falta capital de hoy)"
+        aviso = f" ⚠️ {r['n_sin_capital']} sin capital asignado (no ponderadas)" if r.get("n_sin_capital") else ""
         return (f"n={r['n_cerradas']} (✅ {r['n_ganadoras']} | ❌ {r['n_perdedoras']}) | win rate {r['win_rate_pct']}% | "
-                f"<b>neto real: {ponderado_txt}</b> (suma simple: {r['resultado_neto_pct']:+.2f}%)")
+                f"<b>neto real: {ponderado_txt}</b> (suma simple: {r['resultado_neto_pct']:+.2f}%){aviso}")
 
     r_real = db.resumen_ponderado("senales", desde_fecha, hasta_fecha)
     r_v55 = db.resumen_ponderado("simulaciones_v55", desde_fecha, hasta_fecha)
@@ -725,6 +745,8 @@ def procesar_comando(texto: str) -> str:
         return _cmd_pendientes()
     elif cmd == "/capital":
         return _cmd_capital()
+    elif cmd == "/recalcular_capital":
+        return _cmd_recalcular_capital()
     elif cmd == "/pausar_todo":
         return _cmd_pausar_todo(args)
     elif cmd == "/reanudar_todo":
@@ -765,6 +787,8 @@ def procesar_comando(texto: str) -> str:
             "/estado — resumen de hoy (posiciones, win rate, capital)\n"
             "/pendientes — posiciones abiertas ahora, con pico y tramo de trailing\n"
             "/capital — capital del día (interés compuesto)\n"
+            "/recalcular_capital — fuerza el recálculo de capital de hoy si quedó pospuesto, "
+            "y corrige retroactivamente el neto ponderado de las operaciones de hoy\n"
             "/gates PAR [fix28|v5] — últimos 10 chequeos de gates para un par (diagnóstico)\n"
             "/detalle_v55 [todo] — detalle de cierres de V5.5 fiel (por defecto solo perdedoras): "
             "entrada, pico máximo, resultado, motivo y fecha/hora — para diagnosticar el SL\n"

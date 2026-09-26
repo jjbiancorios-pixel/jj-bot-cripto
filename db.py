@@ -156,9 +156,9 @@ def init_db():
     """)
 
     _migrar_columnas_nuevas(cur)
-    _crear_tabla_simulaciones(cur)
     _crear_tabla_candidatos_v55_ciclo(cur)
     _crear_tabla_sombra_ranked_v55(cur)
+    _crear_tabla_simulaciones(cur)  # su backfill de capital_asignado necesita sombra_ranked_v55 ya creada
 
     conn.commit()
     conn.close()
@@ -386,21 +386,39 @@ def _crear_tabla_simulaciones(cur):
     # el total se divide por el capital total de la cartera. Las
     # simulaciones usan el mismo 5% que usaría la real, para que la
     # comparación sea de manzanas con manzanas.
-    for tabla in ("simulaciones", "simulaciones_directivas", "simulaciones_combo", "simulaciones_fix28_fiel", "simulaciones_v5_fiel", "simulaciones_v55"):
+    TABLAS_CON_CAPITAL_ASIGNADO = (
+        "simulaciones", "simulaciones_directivas", "simulaciones_combo",
+        "simulaciones_fix28_fiel", "simulaciones_v5_fiel", "simulaciones_v55",
+        "sombra_ranked_v55",
+    )
+    for tabla in TABLAS_CON_CAPITAL_ASIGNADO:
         try:
             cur.execute(f"ALTER TABLE {tabla} ADD COLUMN capital_asignado REAL")
         except Exception:
             pass  # ya existe
 
-    # 16/09 FIX: las simulaciones creadas ANTES de agregar la columna
-    # de arriba quedaron con capital_asignado=NULL — la fórmula
-    # ponderada las trataba como si hubieran usado $0 de capital,
-    # dando 0.00% en vez del resultado real (bug real detectado por
-    # Juanjo comparando "neto real" vs. la suma simple). Backfill
-    # retroactivo: usa el capital_dia real de CADA fecha (tabla
-    # capital_diario) × 5%, el mismo cálculo que se usa para las
-    # nuevas.
-    for tabla in ("simulaciones", "simulaciones_directivas", "simulaciones_combo", "simulaciones_fix28_fiel", "simulaciones_v5_fiel", "simulaciones_v55"):
+    _backfill_capital_asignado(cur)
+
+
+def _backfill_capital_asignado(cur):
+    """
+    16/09 FIX, ampliado 26/09 — las simulaciones creadas cuando no había
+    capital_diario del día quedaban con capital_asignado en NULL (antes)
+    o en 0.0 (bug encontrado el 26/09: `_capital_asignado_estimado()`
+    devolvía 0.0 en vez de None cuando faltaba el capital del día, y como
+    0.0 no es NULL, este backfill nunca las corregía — quedaban pegadas
+    en "neto real: +0.00%" para siempre aunque la suma simple fuera
+    correcta). Se corrige el bug en `_capital_asignado_estimado()`
+    (ahora deja NULL) y ACÁ se amplía la condición para reparar también
+    las filas que ya quedaron en 0.0 por el bug viejo, apenas exista un
+    capital_diario real para su fecha (o el más cercano anterior).
+    """
+    TABLAS_CON_CAPITAL_ASIGNADO = (
+        "simulaciones", "simulaciones_directivas", "simulaciones_combo",
+        "simulaciones_fix28_fiel", "simulaciones_v5_fiel", "simulaciones_v55",
+        "sombra_ranked_v55",
+    )
+    for tabla in TABLAS_CON_CAPITAL_ASIGNADO:
         cur.execute(f"""
             UPDATE {tabla}
             SET capital_asignado = (
@@ -408,7 +426,7 @@ def _crear_tabla_simulaciones(cur):
                 FROM capital_diario
                 WHERE capital_diario.fecha = {tabla}.fecha
             )
-            WHERE capital_asignado IS NULL
+            WHERE (capital_asignado IS NULL OR capital_asignado = 0)
               AND EXISTS (SELECT 1 FROM capital_diario WHERE capital_diario.fecha = {tabla}.fecha)
         """)
         # Respaldo: si no hay registro EXACTO de esa fecha (ej. el bot
@@ -423,8 +441,18 @@ def _crear_tabla_simulaciones(cur):
                 ORDER BY capital_diario.fecha DESC
                 LIMIT 1
             )
-            WHERE capital_asignado IS NULL
+            WHERE (capital_asignado IS NULL OR capital_asignado = 0)
+              AND EXISTS (SELECT 1 FROM capital_diario WHERE capital_diario.fecha <= {tabla}.fecha)
         """)
+
+
+def backfill_capital_asignado():
+    """Versión standalone (abre su propia conexión) para llamar bajo demanda desde un comando, sin esperar al próximo reinicio del bot."""
+    conn = _conn()
+    cur = conn.cursor()
+    _backfill_capital_asignado(cur)
+    conn.commit()
+    conn.close()
 
 
 # ── 26/09 — Directiva: registro del LOTE COMPLETO de candidatos de
@@ -802,11 +830,22 @@ def ultimo_ciclo_v55_candidatos() -> list:
     return rows
 
 
-def _capital_asignado_estimado() -> float:
-    """5% del capital de hoy (mismo % que usaría una posición real) — para que las simulaciones sean comparables con capital real."""
+def _capital_asignado_estimado():
+    """
+    5% del capital de hoy (mismo % que usaría una posición real) — para
+    que las simulaciones sean comparables con capital real.
+
+    26/09 FIX: devolvía 0.0 cuando todavía no había capital_diario del
+    día (recálculo pospuesto/fallido) — como 0.0 no es NULL, el backfill
+    de más arriba nunca corregía esas filas después, y quedaban con
+    "neto real: +0.00%" para siempre aunque la suma simple mostrara el
+    resultado correcto (bug detectado por Juanjo el 26/09). Ahora
+    devuelve None (queda NULL en la fila), así el backfill SÍ la agarra
+    apenas exista un capital_diario real para esa fecha.
+    """
     cap = obtener_capital_diario()
     if not cap:
-        return 0.0
+        return None
     return round(cap["capital_dia"] * 0.05, 2)
 
 
@@ -1502,7 +1541,7 @@ def resumen_ponderado(tabla: str, desde_fecha: str = None, hasta_fecha: str = No
     conn = _conn()
     cur = conn.cursor()
     campo_bu = "bu_order_id IS NOT NULL AND " if tabla == "senales" else ""
-    query = f"SELECT resultado_pct, capital_asignado FROM {tabla} WHERE {campo_bu}cerrado = 1 AND resultado_pct IS NOT NULL"
+    query = f"SELECT resultado_pct, capital_asignado, fecha FROM {tabla} WHERE {campo_bu}cerrado = 1 AND resultado_pct IS NOT NULL"
     params = []
     if desde_fecha:
         query += " AND fecha_cierre >= ?"
@@ -1512,6 +1551,17 @@ def resumen_ponderado(tabla: str, desde_fecha: str = None, hasta_fecha: str = No
         params.append(hasta_fecha)
     cur.execute(query, tuple(params))
     filas = cur.fetchall()
+
+    # 26/09 FIX: antes, una fila sin capital_asignado (recálculo diario
+    # pospuesto o fallido ese día) se trataba en silencio como si hubiera
+    # usado $0 de capital — el "neto real" daba +0.00% en vez de reflejar
+    # el resultado, indistinguible de un resultado genuino de 0 (bug
+    # detectado por Juanjo el 26/09). Ahora, si falta, se resuelve al
+    # vuelo con el capital_dia de esa MISMA fecha (o el más cercano
+    # anterior) en vez de depender solo del backfill guardado en la fila.
+    cur.execute("SELECT fecha, capital_dia FROM capital_diario ORDER BY fecha ASC")
+    capital_por_fecha = {f: c for f, c in cur.fetchall()}
+    fechas_con_capital = sorted(capital_por_fecha.keys())
     conn.close()
 
     if not filas:
@@ -1525,26 +1575,35 @@ def resumen_ponderado(tabla: str, desde_fecha: str = None, hasta_fecha: str = No
         # pospone el recálculo indefinidamente mientras el bot está
         # activo) — usar el capital_dia MÁS RECIENTE disponible, en
         # vez de mostrar "s/d" cada vez que esto pase.
-        conn2 = _conn()
-        cur2 = conn2.cursor()
-        cur2.execute("SELECT capital_dia FROM capital_diario ORDER BY fecha DESC LIMIT 1")
-        row2 = cur2.fetchone()
-        conn2.close()
-        capital_total = row2[0] if row2 else None
+        capital_total = capital_por_fecha[fechas_con_capital[-1]] if fechas_con_capital else None
+
+    def _capital_asignado_para_fecha(fecha):
+        if fecha in capital_por_fecha:
+            return round(capital_por_fecha[fecha] * 0.05, 2)
+        anteriores = [f for f in fechas_con_capital if f <= fecha]
+        if anteriores:
+            return round(capital_por_fecha[anteriores[-1]] * 0.05, 2)
+        return None
 
     ganancia_usd = 0.0
     n_ganadoras = 0
     resultados_pct = []
-    for resultado_pct, capital_asignado in filas:
+    n_sin_capital = 0
+    for resultado_pct, capital_asignado, fecha in filas:
         resultados_pct.append(resultado_pct)
         if resultado_pct > 0:
             n_ganadoras += 1
-        cap_op = capital_asignado if capital_asignado else 0
+        cap_op = capital_asignado
+        if not cap_op:
+            cap_op = _capital_asignado_para_fecha(fecha)
+            if not cap_op:
+                n_sin_capital += 1
+                cap_op = 0
         ganancia_usd += (resultado_pct / 100) * cap_op
 
     neto_ponderado_pct = round((ganancia_usd / capital_total) * 100, 2) if capital_total else None
 
-    return {
+    resultado = {
         "n_cerradas": len(filas),
         "n_ganadoras": n_ganadoras,
         "n_perdedoras": len(filas) - n_ganadoras,
@@ -1553,6 +1612,13 @@ def resumen_ponderado(tabla: str, desde_fecha: str = None, hasta_fecha: str = No
         "ganancia_usd": round(ganancia_usd, 2),
         "neto_ponderado_pct": neto_ponderado_pct,  # el número correcto
     }
+    if n_sin_capital:
+        # No hay NINGÚN capital_diario (ni de esa fecha ni anterior) para
+        # estas filas — pasa solo si el bot nunca tuvo un recálculo
+        # exitoso todavía. Se avisa en vez de contarlas silenciosamente
+        # como $0 de capital.
+        resultado["n_sin_capital"] = n_sin_capital
+    return resultado
 
 
 def resumen_completo(desde_fecha: str = None, hasta_fecha: str = None, por_cierre: bool = False) -> dict:
