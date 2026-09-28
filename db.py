@@ -501,6 +501,15 @@ def _crear_tabla_candidatos_v55_ciclo(cur):
             pass  # ya existe
     cur.execute("CREATE INDEX IF NOT EXISTS idx_candidatos_v55_ciclo_seguimiento ON candidatos_v55_ciclo (seguimiento_activo, terminado)")
 
+    # 28/09 — Directiva: Candado de Tendencia Macro (BTC EMA9/EMA21 1h).
+    # 1 = la señal calificó en dirección contraria a la tendencia macro
+    # de BTC y quedó excluida del corte de ejecución real, aunque siga
+    # rankeada y en sombra — para poder medir el impacto del candado.
+    try:
+        cur.execute("ALTER TABLE candidatos_v55_ciclo ADD COLUMN bloqueado_btc_macro INTEGER DEFAULT 0")
+    except Exception:
+        pass  # ya existe
+
 
 TOP_SEGUIMIENTO_V55_CICLO = 10  # cuántos candidatos por ciclo (de arriba hacia abajo) reciben seguimiento de 12hs
 
@@ -530,15 +539,21 @@ def guardar_candidatos_v55_ciclo(candidatos_ordenados: list):
         (
             ciclo_ts, fecha, hora,
             c.get("par"), c.get("direccion"), c.get("rsi_15m"), c.get("fuerza_score_v55"),
-            i, 1 if i <= 2 else 0, c.get("precio"),
+            # 28/09: "ejecutado" ahora refleja si de verdad se mandó a
+            # ejecución real (ejecutado_real, calculado en
+            # aplicar_ranking_v55 EXCLUYENDO a los bloqueados por el
+            # Candado de Tendencia Macro) — ya no alcanza con estar en
+            # el top-2 crudo del ranking si el candado lo vetó.
+            i, 1 if c.get("ejecutado_real") else 0, c.get("precio"),
             1 if i <= TOP_SEGUIMIENTO_V55_CICLO else 0, ciclo_ts,
+            1 if c.get("bloqueado_btc_macro") else 0,
         )
         for i, c in enumerate(candidatos_ordenados, start=1)
     ]
     cur.executemany("""
         INSERT INTO candidatos_v55_ciclo
-            (ciclo_ts, fecha, hora, par, direccion, rsi_15m, score, posicion, ejecutado, precio, seguimiento_activo, creado)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+            (ciclo_ts, fecha, hora, par, direccion, rsi_15m, score, posicion, ejecutado, precio, seguimiento_activo, creado, bloqueado_btc_macro)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
     """, filas)
     conn.commit()
     conn.close()

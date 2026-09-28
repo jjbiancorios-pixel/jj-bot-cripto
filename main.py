@@ -326,6 +326,19 @@ def aplicar_ranking_v55(candidatos_calificados_ciclo: list) -> list:
 
     candidatos_ordenados = sorted(candidatos_calificados_ciclo, key=lambda x: x.get("fuerza_score_v55", -999.0), reverse=True)
 
+    # 28/09 — Directiva: Candado de Tendencia Macro. El corte de
+    # ejecución REAL (top-2) se calcula EXCLUYENDO a los candidatos
+    # marcados bloqueado_btc_macro=True — esos siguen en el ranking
+    # completo (candidatos_v55_ciclo) y en la sombra, para poder medir
+    # después si bloquearlos fue una mejora real. `ejecutado_real` (no
+    # la posición cruda) es lo que decide qué se marca como ejecutado
+    # en la base, para no mentir sobre qué se mandó a capital real.
+    candidatos_no_bloqueados = [c for c in candidatos_ordenados if not c.get("bloqueado_btc_macro")]
+    top2_reales = candidatos_no_bloqueados[:2]
+    ids_top2_reales = {id(c) for c in top2_reales}
+    for c in candidatos_ordenados:
+        c["ejecutado_real"] = id(c) in ids_top2_reales
+
     # 26/09 — Directiva: capturar el LOTE COMPLETO del ciclo (ejecutados
     # y descartados) justo ACÁ, antes del recorte a los 2 mejores, y
     # persistirlo en SQLite de forma masiva. Esto es lo único que
@@ -347,7 +360,7 @@ def aplicar_ranking_v55(candidatos_calificados_ciclo: list) -> list:
     except Exception as e:
         print(f"Error abriendo sombra_ranked_v55: {e}")
 
-    return candidatos_ordenados[:2]
+    return top2_reales
 
 
 def calc_atr(df, p=14):
@@ -586,6 +599,25 @@ def analizar_par_v5(par: str, btc: dict):
         return None
     direccion = "LARGO" if ema9_1h > ema21_1h else "CORTO"
 
+    # 28/09 — Directiva: Candado de Tendencia Macro. El cruce EMA9/EMA21
+    # de la propia altcoin en 1h es un indicador rezagado: en una
+    # reversión rápida liderada por BTC, puede seguir marcando la
+    # dirección vieja mientras el precio ya está siendo arrastrado por
+    # BTC. Reusa btc["estado"] (ya calculado en analizar_btc(), mismo
+    # cruce EMA9/EMA21 1h pero de BTC) en vez de recalcularlo. En
+    # LATERAL o SIN_DATO no bloquea ninguna dirección (fail-open: mejor
+    # dejar operar el ranking normal que frenar todo el bot por un
+    # bache de datos de BTC). La señal se sigue calificando y
+    # persistiendo normal (candidatos_v55_ciclo + sombra) — lo único
+    # que cambia es que se excluye del corte de ejecución REAL en
+    # aplicar_ranking_v55, para poder medir el impacto con datos antes
+    # de confiar en el candado a ciegas.
+    estado_btc = btc.get("estado") if btc else None
+    bloqueado_btc_macro = (
+        (direccion == "LARGO" and estado_btc == "BAJISTA")
+        or (direccion == "CORTO" and estado_btc == "ALCISTA")
+    )
+
     # Persistencia (se mantiene, sin cambios respecto al diseño anterior)
     ema9_serie = df1h["close"].ewm(span=9).mean()
     ema21_serie = df1h["close"].ewm(span=21).mean()
@@ -640,6 +672,7 @@ def analizar_par_v5(par: str, btc: dict):
         "par": par, "direccion": direccion, "precio": precio,
         "adx": round(adx, 2), "rsi": round(rsi_15m, 2), "atr_pct": round(atr_pct, 3),
         "rsi_15m": rsi_15m, "pendiente_rsi": pendiente_rsi,  # 20/09 — Directiva V5.2 (Ranking de Fuerza)
+        "bloqueado_btc_macro": bloqueado_btc_macro,  # 28/09 — Candado de Tendencia Macro
         "score": 10, "razones": [f"V5.0: ADX(1h)={round(adx,1)} RSI(15m)={round(rsi_15m,1)}"],
         "rango_pct": grid["rango_pct"], "rango_bajo": round(grid["bottom"], 6),
         "rango_alto": round(grid["top"], 6), "grillas": grid["grillas"],

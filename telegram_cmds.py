@@ -549,7 +549,9 @@ def _cmd_candidatos_v55() -> str:
 
     lineas = [f"📋 <b>Candidatos V5.5 — último ciclo</b> ({filas[0]['fecha']} {filas[0]['hora']}, {len(filas)} calificados)"]
     for f in filas:
-        marca = "✅" if f["ejecutado"] else "▫️"
+        # 28/09: 🔒 = calificó pero el Candado de Tendencia Macro lo vetó
+        # de la ejecución real (sigue en sombra, para medir impacto)
+        marca = "✅" if f["ejecutado"] else ("🔒" if f.get("bloqueado_btc_macro") else "▫️")
         rsi = f.get("rsi_15m")
         score = f.get("score")
         rsi_txt = f"{rsi:.1f}" if rsi is not None else "s/d"
