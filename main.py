@@ -877,7 +877,16 @@ def abrir_posicion_real(candidato: dict):
         top=candidato["rango_alto"], bottom=candidato["rango_bajo"],
         row=candidato["grillas"], capital_objetivo_usdt=capital,
         leverage=gestion_riesgo.LEVERAGE_FIJO, trend=trend,
-        sl_pct=gestion_riesgo.SL_FIJO_PCT,  # 04/09: SL nativo de respaldo, además del monitoreo activo
+        # 29/09 FIX: quedó en SL_FIJO_PCT (-7.5%, fix28/V5.0) desde el
+        # 04/09 — el SL nativo de respaldo cerraba la posición en el
+        # exchange antes de que el monitoreo activo (evaluar_cierre_v55,
+        # -25% apalancado) llegara a intervenir. Efecto real: 6+
+        # posiciones reales cerradas por este SL viejo (~-7.5% + slippage)
+        # nunca se marcaron como cerradas en la base (cerrar_senal solo
+        # corre cuando el cierre lo detecta NUESTRO monitoreo), quedando
+        # como "abiertas"/huérfanas y afuera de /informe — sesgando las
+        # estadísticas al excluir justo esas pérdidas.
+        sl_pct=gestion_riesgo.SL_V55_PCT,  # SL nativo de respaldo, ahora alineado con V5.5
     )
 
     if not resultado["ok"]:
