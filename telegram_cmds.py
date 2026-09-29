@@ -52,16 +52,48 @@ def _api(method: str, **params):
         return {}
 
 
+TELEGRAM_MAX_CHARS = 3800  # límite real de Telegram es 4096; dejamos margen
+
+
+def _partir_mensaje(msg: str) -> list:
+    """
+    29/09 — Telegram rechaza (en silencio para el usuario, ver más abajo)
+    cualquier mensaje de más de 4096 caracteres. /listar_senales_real
+    (y potencialmente /informe, /comparar con "todo" en cuentas con
+    mucho historial) podían generar un texto más largo que eso sin que
+    nadie se enterara de por qué "no respondía". Parte por líneas
+    completas para no cortar una etiqueta HTML a la mitad.
+    """
+    if len(msg) <= TELEGRAM_MAX_CHARS:
+        return [msg]
+    partes = []
+    actual = ""
+    for linea in msg.split("\n"):
+        candidato = f"{actual}\n{linea}" if actual else linea
+        if len(candidato) > TELEGRAM_MAX_CHARS:
+            if actual:
+                partes.append(actual)
+            actual = linea
+        else:
+            actual = candidato
+    if actual:
+        partes.append(actual)
+    return partes
+
+
 def enviar(msg: str):
-    resultado = _api("sendMessage", chat_id=CHAT_ID, text=msg, parse_mode="HTML")
-    if not resultado.get("ok"):
-        # 05/09 FIX: antes esto fallaba en silencio total — si Telegram
-        # rechaza el envío (ej. 429 Too Many Requests por flood-limit,
-        # bloqueo temporal del chat), no había forma de saberlo. Esto
-        # puede haber pasado real el 05/09 tras el loop de mensajes
-        # duplicados de BOT_ORDER_ALREADY_CLOSED antes del fix.
-        print(f"⚠️ enviar(): Telegram RECHAZÓ el mensaje — {str(resultado)[:300]}")
-    return resultado
+    ultimo_resultado = {}
+    for i, parte in enumerate(_partir_mensaje(msg)):
+        ultimo_resultado = _api("sendMessage", chat_id=CHAT_ID, text=parte, parse_mode="HTML")
+        if not ultimo_resultado.get("ok"):
+            # 05/09 FIX: antes esto fallaba en silencio total — si Telegram
+            # rechaza el envío (ej. 429 Too Many Requests por flood-limit,
+            # bloqueo temporal del chat, o mensaje demasiado largo), no
+            # había forma de saberlo. Esto puede haber pasado real el
+            # 05/09 tras el loop de mensajes duplicados de
+            # BOT_ORDER_ALREADY_CLOSED antes del fix.
+            print(f"⚠️ enviar(): Telegram RECHAZÓ el mensaje (parte {i+1}) — {str(ultimo_resultado)[:300]}")
+    return ultimo_resultado
 
 
 def _parse_float(s):
