@@ -886,7 +886,7 @@ def abrir_posicion_real(candidato: dict):
         # corre cuando el cierre lo detecta NUESTRO monitoreo), quedando
         # como "abiertas"/huérfanas y afuera de /informe — sesgando las
         # estadísticas al excluir justo esas pérdidas.
-        sl_pct=gestion_riesgo.SL_V55_PCT,  # SL nativo de respaldo, ahora alineado con V5.5
+        sl_pct=gestion_riesgo.SL_NATIVO_RESPALDO_PCT,  # única fuente de verdad, ver gestion_riesgo.py
     )
 
     if not resultado["ok"]:
@@ -1356,16 +1356,55 @@ def chequeo_rapido_riesgo():
 
 # ── Huérfanas — cada 30 min ──────────────────────────────────
 def chequear_huerfanas():
+    """
+    29/09 — REDISEÑADA: antes solo avisaba "posible huérfana, revisar
+    manualmente" y dejaba la señal colgada en la base para siempre (ni
+    /informe ni el tope de 6 posiciones simultáneas se enteraban de que
+    ya no existía en Pionex). Esto fue justo lo que pasó con el bug del
+    SL nativo desalineado (ver SL_NATIVO_RESPALDO_PCT en
+    gestion_riesgo.py): 6 posiciones reales cerradas por Pionex quedaron
+    invisibles para nuestras estadísticas y bloqueando esos pares para
+    nuevas aperturas.
+
+    Ahora, antes de avisar, intenta reconciliar sola: le pregunta a
+    Pionex por esa orden puntual (esta_cerrada) y, si confirma que ya
+    cerró y devuelve un resultado calculable, cierra la señal en
+    nuestra base con ESE resultado real y un motivo que deja rastro de
+    que no fue nuestro monitoreo el que la cerró — así nunca más una
+    pérdida (o ganancia) queda fuera de /informe ni un par queda
+    trabado sin que nadie se entere. Si Pionex no puede confirmar el
+    cierre o no da un resultado calculable, recién ahí cae al aviso
+    manual de siempre (no se inventa un resultado).
+    """
     try:
         reales = pionex_api.listar_grillas_abiertas()  # ya devuelve la lista filtrada
         ids_reales = {str(g.get("buOrderId")) for g in reales if g.get("buOrderId")}
 
         nuestras = db.posiciones_abiertas()
         for senal in nuestras:
-            if str(senal["bu_order_id"]) not in ids_reales:
+            if str(senal["bu_order_id"]) in ids_reales:
+                continue
+
+            info = None
+            try:
+                info = pionex_api.esta_cerrada(senal["bu_order_id"])
+            except Exception as e:
+                print(f"⚠️ chequear_huerfanas: esta_cerrada falló para {senal['par']}: {e}")
+
+            if info and info.get("cerrada") and info.get("resultado_pct") is not None:
+                motivo = f"cerrado_externo:{info.get('motivo') or 's/d'}"
+                db.cerrar_senal(senal["id"], info["resultado_pct"], motivo)
+                telegram_cmds.enviar(
+                    f"🔄 <b>Reconciliada</b>: {senal['par']} (id {senal['id']}) ya no estaba en Pionex — "
+                    f"se cerró afuera de nuestro monitoreo. Resultado real: {info['resultado_pct']:+.2f}% "
+                    f"({motivo}). Ya se registró en la base y vuelve a estar disponible para nuevas entradas."
+                )
+            else:
                 telegram_cmds.enviar(
                     f"👻 <b>Posible huérfana</b>: {senal['par']} (id {senal['id']}) figura abierta en "
-                    f"nuestra base pero NO aparece en la lista real de Pionex — REVISAR manualmente."
+                    f"nuestra base pero NO aparece en la lista real de Pionex, y no pude confirmar el "
+                    f"cierre/resultado directo con Pionex — REVISAR manualmente (ej. /debug_orden, "
+                    f"/cerrar_manual)."
                 )
     except Exception as e:
         print(f"⚠️ chequear_huerfanas: {e}")

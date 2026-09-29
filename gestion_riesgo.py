@@ -274,6 +274,19 @@ SL_V55_PCT = -25.0  # apalancado (10x) = -2.5% de movimiento real de precio
 PICO_ACTIVACION_V55_PCT = 5.0  # apalancado (10x) = +0.5% de movimiento real
 RETROCESO_V55_PCT = 10  # fijo, un solo tramo — igual patrón que V5.0/Directivas
 
+# 29/09 — FUENTE ÚNICA DE VERDAD para el SL nativo de respaldo que se
+# manda a Pionex al abrir una posición real (abrir_posicion_real, en
+# main.py). Hasta hoy ese respaldo apuntaba a su propia constante
+# (SL_FIJO_PCT, -7.5%, la de fix28/V5.0) mientras el monitoreo activo
+# ya usaba SL_V55_PCT (-25%) desde el 24/09 — las dos nunca se
+# volvieron a sincronizar a mano y el nativo terminó cerrando
+# posiciones reales antes de que el monitoreo llegara a intervenir
+# (bug encontrado y corregido el 29/09).
+# Regla de ahí en más: cuando cambie la estrategia real activa (ej.
+# una V6), actualizar SOLO esta línea — nunca tocar directamente el
+# sl_pct de abrir_posicion_real.
+SL_NATIVO_RESPALDO_PCT = SL_V55_PCT
+
 
 def evaluar_cierre_v55(direccion: str, pico_maximo_pct: float, resultado_actual_pct: float) -> dict:
     """
