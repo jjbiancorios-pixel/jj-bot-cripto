@@ -1406,6 +1406,53 @@ def posiciones_abiertas() -> list:
     return rows
 
 
+def listar_senales_real(desde_fecha: str = None, hasta_fecha: str = None) -> list:
+    """
+    29/09 — Lista TODAS las señales reales (bu_order_id IS NOT NULL),
+    abiertas o cerradas, para poder identificar registros viejos/de
+    prueba que no deberían contar en las estadísticas (ej. las 3
+    señales de los inicios de V5.5, o las que quedaron colgadas por el
+    bug del SL nativo). Usado por /listar_senales_real.
+    """
+    conn = _conn()
+    cur = conn.cursor()
+    query = "SELECT * FROM senales WHERE bu_order_id IS NOT NULL"
+    params = []
+    if desde_fecha:
+        query += " AND fecha >= ?"
+        params.append(desde_fecha)
+    if hasta_fecha:
+        query += " AND fecha <= ?"
+        params.append(hasta_fecha)
+    query += " ORDER BY fecha ASC, hora_alerta ASC"
+    cur.execute(query, tuple(params))
+    rows = [dict(r) for r in cur.fetchall()]
+    conn.close()
+    return rows
+
+
+def eliminar_senal(senal_id: int) -> bool:
+    """
+    29/09 — Elimina definitivamente una señal REAL de la base (a
+    diferencia de cerrar_senal, que la cierra pero la conserva). Para
+    registros que nunca deberían haber contado en las estadísticas:
+    pruebas de inicio de estrategia, o cierres que en realidad los
+    disparó un mecanismo distinto al que se quiere medir (ej. el SL
+    nativo viejo en vez de la salida V5.5). Solo aplica a "senales"
+    (real) — no toca ninguna tabla de simulación/sombra.
+    """
+    conn = _conn()
+    cur = conn.cursor()
+    cur.execute("SELECT id FROM senales WHERE id = ? AND bu_order_id IS NOT NULL", (senal_id,))
+    if not cur.fetchone():
+        conn.close()
+        return False
+    cur.execute("DELETE FROM senales WHERE id = ?", (senal_id,))
+    conn.commit()
+    conn.close()
+    return True
+
+
 def contar_posiciones_abiertas() -> int:
     conn = _conn()
     cur = conn.cursor()

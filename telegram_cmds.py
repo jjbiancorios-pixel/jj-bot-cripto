@@ -290,6 +290,61 @@ def _cmd_cerrar_manual(args: list) -> str:
     return f"✅ {par} (id {senal['id']}) marcado como cerrado en nuestra base — resultado {resultado:+.2f}%. Ya no debería aparecer en /pendientes ni como huérfana."
 
 
+def _cmd_listar_senales_real(args: list) -> str:
+    """
+    29/09 — Lista TODAS las señales reales (abiertas y cerradas), con su
+    id, fecha y estado, para identificar registros viejos/de prueba o
+    inválidos antes de decidir si eliminarlos con /eliminar_senal.
+    Uso: /listar_senales_real [FECHA|todo]
+    Ej: /listar_senales_real 20260929
+        /listar_senales_real todo
+    """
+    desde_fecha = None
+    if args and args[0].lower() != "todo":
+        desde_fecha = args[0]
+    filas = db.listar_senales_real(desde_fecha)
+    etiqueta = "TODO EL HISTORIAL" if desde_fecha is None else desde_fecha
+    if not filas:
+        return f"📋 <b>Señales reales — {etiqueta}</b>\nNo hay ninguna."
+
+    lineas = [f"📋 <b>Señales reales — {etiqueta}</b> ({len(filas)}):"]
+    for f in filas:
+        estado = "🟢 abierta" if f["cerrado"] == 0 else "⚪ cerrada"
+        resultado_txt = f"{f['resultado_pct']:+.2f}%" if f.get("resultado_pct") is not None else "s/d"
+        motivo_txt = f" ({f['motivo_cierre']})" if f.get("motivo_cierre") else ""
+        lineas.append(
+            f"#{f['id']} {f['par']} {f['direccion']} | {f['fecha']} {f['hora_alerta']} | "
+            f"{estado} | {resultado_txt}{motivo_txt}"
+        )
+    return "\n".join(lineas)
+
+
+def _cmd_eliminar_senal(args: list) -> str:
+    """
+    29/09 — Elimina definitivamente una señal real de la base (no la
+    cierra, la borra). Para registros inválidos que no deben contar en
+    ninguna estadística: pruebas de inicio de estrategia, o cierres
+    disparados por un mecanismo distinto al que se quiere medir.
+    Uso: /eliminar_senal ID [ID2 ID3 ...]
+    Ej: /eliminar_senal 382
+        /eliminar_senal 382 384 385 387 388 389
+    """
+    if not args:
+        return "Uso: /eliminar_senal ID [ID2 ID3 ...]\nEj: /eliminar_senal 382 384 385"
+    resultados = []
+    for a in args:
+        try:
+            senal_id = int(a)
+        except ValueError:
+            resultados.append(f"⚠️ '{a}' no es un id válido, se saltea.")
+            continue
+        if db.eliminar_senal(senal_id):
+            resultados.append(f"🗑️ #{senal_id} eliminada.")
+        else:
+            resultados.append(f"⚠️ #{senal_id} no encontrada entre las señales reales.")
+    return "\n".join(resultados)
+
+
 def _cmd_informe(args: list) -> str:
     """
     07/09 — Informe completo para análisis. 10/09: ahora soporta rango de
@@ -783,6 +838,10 @@ def procesar_comando(texto: str) -> str:
         return _cmd_debug_orden(args)
     elif cmd == "/cerrar_manual":
         return _cmd_cerrar_manual(args)
+    elif cmd == "/listar_senales_real":
+        return _cmd_listar_senales_real(args)
+    elif cmd == "/eliminar_senal":
+        return _cmd_eliminar_senal(args)
     elif cmd in ("/ayuda", "/help", "/start"):
         return (
             "🤖 <b>Bot Cripto v2 — Comandos</b>\n\n"
@@ -814,6 +873,10 @@ def procesar_comando(texto: str) -> str:
             "/debug_orden PAR — respuesta cruda de Pionex para una posición (diagnóstico)\n"
             "/cerrar_manual PAR RESULTADO_PCT — corrige una posición ya cerrada por vos "
             "que nuestra base sigue mostrando abierta (ej: /cerrar_manual TAO -0.66)\n"
+            "/listar_senales_real [FECHA|todo] — lista TODAS las señales reales (abiertas y "
+            "cerradas) con id, fecha y resultado, para identificar registros inválidos\n"
+            "/eliminar_senal ID [ID2 ID3...] — BORRA definitivamente una o más señales reales "
+            "de la base (no las cierra, las elimina). Usar con cuidado.\n"
             "/pausar_todo [motivo] — frena aperturas nuevas (SL/trailing sigue activo)\n"
             "/reanudar_todo\n"
             "/probar_pionex PAR PRECIO — prueba conexión sin crear orden real\n"
