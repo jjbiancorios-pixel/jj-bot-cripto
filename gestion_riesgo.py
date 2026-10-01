@@ -413,9 +413,9 @@ def hay_lugar_para_abrir_v55() -> dict:
 
 def calcular_capital_por_operacion() -> float:
     """
-    Capital del día ya fijado (00:01 ARG) × 5%. Si el recálculo diario
-    todavía no corrió (posiciones abiertas a las 00:01), devuelve None
-    — el llamador debe abstenerse de abrir hasta que haya un valor real.
+    Capital del día ya fijado (00:01 ARG, real o de RESPALDO) × 5%. Si
+    todavía no hay ningún valor (ni siquiera de respaldo), devuelve None
+    — el llamador debe abstenerse de abrir hasta que haya un valor.
     """
     cap = db.obtener_capital_diario()
     if not cap:
@@ -423,20 +423,36 @@ def calcular_capital_por_operacion() -> float:
     return round(cap["capital_dia"] * PCT_CAPITAL_POR_OPERACION, 2)
 
 
+# 30/09 — Claves de `config` usadas para trackear hace cuánto está pendiente
+# el recálculo real y cuándo fue el último aviso por Telegram al respecto.
+CONFIG_PENDIENTE_DESDE = "recalculo_pendiente_desde"
+CONFIG_ULTIMO_AVISO = "recalculo_ultimo_aviso"
+RECALCULO_ALERTA_MINUTOS = 60      # primer aviso a los 60 min de pendiente
+RECALCULO_RECORDATORIO_MINUTOS = 60  # después, recordatorio cada 60 min
+
+
 def intentar_recalculo_diario(forzar: bool = False) -> str:
     """
     Recalcula el capital del día: 5% del balance REAL de Pionex.
-    Se llama desde el scheduler a las 00:01 ARG, y reintenta cada 1 min
-    si hay posiciones abiertas (no se puede confiar el balance con
-    capital comprometido en grillas activas).
+    Se llama desde el scheduler a las 00:01 ARG, y se reintenta luego
+    (vía chequear_y_gestionar_recalculo_diario) mientras haya posiciones
+    abiertas (no se puede confiar el balance con capital comprometido en
+    grillas activas).
     Sin reserva de ningún tipo — si el capital bajó, las operaciones del
     día son más chicas en USD, sin excepción (decisión confirmada 03/09).
+
+    30/09 — Ya NO se aborta solo porque exista un registro de hoy: si ese
+    registro es de RESPALDO (es_fallback=1, copiado del día anterior
+    mientras se esperaba), igual se sigue intentando el recálculo real acá
+    debajo. Solo un registro REAL de hoy corta el intento.
     """
-    if not forzar and db.obtener_capital_diario():
-        return None  # ya se recalculó hoy, no hacer nada
+    cap_actual = db.obtener_capital_diario()
+    ya_es_real_hoy = bool(cap_actual) and not cap_actual.get("es_fallback")
+    if not forzar and ya_es_real_hoy:
+        return None  # ya se recalculó hoy con un valor real, no hacer nada
 
     if db.contar_posiciones_abiertas() > 0 and not forzar:
-        return None  # pospuesto, hay posiciones abiertas — reintentar en 1 min
+        return None  # pospuesto, hay posiciones abiertas — se reintenta después
 
     try:
         balance = pionex_api.obtener_balance_cuenta()
@@ -447,5 +463,98 @@ def intentar_recalculo_diario(forzar: bool = False) -> str:
         return "⚠️ El balance consultado en Pionex fue 0 o inválido — recálculo diario NO aplicado, revisar manualmente."
 
     tamano_objetivo = round(balance * PCT_CAPITAL_POR_OPERACION, 2)
-    db.guardar_capital_diario(balance, tamano_objetivo)
+    db.guardar_capital_diario(balance, tamano_objetivo, es_fallback=False)
+    # Recálculo real logrado: se limpia cualquier estado de "pendiente"/avisos.
+    db.borrar_config(CONFIG_PENDIENTE_DESDE)
+    db.borrar_config(CONFIG_ULTIMO_AVISO)
     return f"✅ Capital del día recalculado: USD {balance:.2f} — USD {tamano_objetivo:.2f} por operación (5%)."
+
+
+def chequear_y_gestionar_recalculo_diario() -> str:
+    """
+    30/09 — Reemplaza el simple reintento de 1 minuto. Pensado para
+    llamarse cada 1 minuto desde el scheduler. Hace tres cosas:
+
+      1. Intenta el recálculo REAL (solo tiene efecto una vez que no
+         queden posiciones abiertas).
+      2. Si sigue pospuesto y todavía no hay NINGÚN capital para hoy
+         (ni real ni de respaldo), activa un capital de RESPALDO copiando
+         el capital_dia del día anterior — así no se bloquean aperturas
+         reales nuevas mientras se espera el recálculo genuino.
+      3. Si el recálculo real sigue sin resolverse, avisa por Telegram a
+         los 60 minutos de quedar pendiente, y después cada 60 minutos
+         (recordatorio), hasta que se resuelva.
+
+    Devuelve un string para enviar por Telegram, o None si no hay nada
+    que avisar todavía.
+    """
+    cap_hoy = db.obtener_capital_diario()
+    if cap_hoy and not cap_hoy.get("es_fallback"):
+        return None  # ya hay capital real de hoy, nada que hacer
+
+    # Intento real (solo prospera si ya no hay posiciones abiertas).
+    resultado_real = intentar_recalculo_diario()
+    if resultado_real:
+        return resultado_real
+
+    mensajes = []
+
+    # Sigue pospuesto. Si no hay NINGÚN capital para hoy todavía, activar respaldo.
+    cap_hoy = db.obtener_capital_diario()
+    if not cap_hoy:
+        anterior = db.obtener_capital_diario_anterior()
+        if anterior:
+            db.guardar_capital_diario(anterior["capital_dia"], anterior["tamano_objetivo"], es_fallback=True)
+            mensajes.append(
+                f"⏳ Recálculo diario pospuesto (hay posiciones reales abiertas). "
+                f"Mientras tanto se usa como RESPALDO el capital del día anterior: "
+                f"USD {anterior['capital_dia']:.2f} (USD {anterior['tamano_objetivo']:.2f} por operación), "
+                f"para no bloquear aperturas nuevas."
+            )
+        else:
+            mensajes.append(
+                "⚠️ Recálculo diario pospuesto (hay posiciones reales abiertas) y no hay ningún "
+                "capital_diario anterior guardado para usar de respaldo — no se abrirán operaciones "
+                "reales nuevas hasta que esto se resuelva."
+            )
+
+    ahora = datetime.now(TZ_ARG)
+    pendiente_desde_str = db.obtener_config(CONFIG_PENDIENTE_DESDE)
+    if not pendiente_desde_str:
+        db.guardar_config(CONFIG_PENDIENTE_DESDE, ahora.isoformat())
+        return "\n".join(mensajes) if mensajes else None
+
+    try:
+        pendiente_desde = datetime.fromisoformat(pendiente_desde_str)
+    except Exception:
+        pendiente_desde = ahora
+        db.guardar_config(CONFIG_PENDIENTE_DESDE, ahora.isoformat())
+
+    minutos_pendiente = (ahora - pendiente_desde).total_seconds() / 60
+    if minutos_pendiente < RECALCULO_ALERTA_MINUTOS:
+        return "\n".join(mensajes) if mensajes else None
+
+    ultimo_aviso_str = db.obtener_config(CONFIG_ULTIMO_AVISO)
+    debe_avisar = True
+    if ultimo_aviso_str:
+        try:
+            ultimo_aviso = datetime.fromisoformat(ultimo_aviso_str)
+            debe_avisar = (ahora - ultimo_aviso).total_seconds() / 60 >= RECALCULO_RECORDATORIO_MINUTOS
+        except Exception:
+            debe_avisar = True
+
+    if debe_avisar:
+        db.guardar_config(CONFIG_ULTIMO_AVISO, ahora.isoformat())
+        horas = int(minutos_pendiente // 60)
+        mins = int(minutos_pendiente % 60)
+        cap_hoy = db.obtener_capital_diario()
+        usando_respaldo = bool(cap_hoy and cap_hoy.get("es_fallback"))
+        mensajes.append(
+            f"🔴 Recálculo diario de capital sigue PENDIENTE desde hace {horas}h {mins}min "
+            f"(posiciones reales todavía abiertas). "
+            + ("Se sigue operando con el capital de RESPALDO del día anterior."
+               if usando_respaldo else
+               "No hay capital de respaldo disponible — no se están abriendo operaciones reales nuevas.")
+        )
+
+    return "\n".join(mensajes) if mensajes else None

@@ -56,6 +56,15 @@ def _migrar_columnas_nuevas(cur):
         except Exception:
             pass  # ya existe
 
+    # 30/09 — columna para distinguir un capital_diario REAL (recalculado
+    # genuinamente a las 00:01 o cuando bajó a 0 posiciones abiertas) de un
+    # capital_diario de RESPALDO (copiado del día anterior mientras el
+    # recálculo real seguía pendiente por tener posiciones abiertas).
+    try:
+        cur.execute("ALTER TABLE capital_diario ADD COLUMN es_fallback INTEGER DEFAULT 0")
+    except Exception:
+        pass  # ya existe
+
 
 def init_db():
     """Crea las tablas si no existen. Llamar una vez al iniciar el bot."""
@@ -123,7 +132,8 @@ def init_db():
             fecha TEXT PRIMARY KEY,
             capital_dia REAL NOT NULL,
             tamano_objetivo REAL NOT NULL,
-            creado TEXT NOT NULL
+            creado TEXT NOT NULL,
+            es_fallback INTEGER DEFAULT 0
         )
     """)
 
@@ -1565,20 +1575,20 @@ def cerrar_senal(senal_id: int, resultado_pct: float, motivo: str):
 
 
 # ── Capital diario (interés compuesto, sin reserva) ─────────
-def guardar_capital_diario(capital_dia: float, tamano_objetivo: float):
+def guardar_capital_diario(capital_dia: float, tamano_objetivo: float, es_fallback: bool = False):
     conn = _conn()
     cur = conn.cursor()
     hoy = datetime.now(TZ_ARG).strftime("%Y%m%d")
     cur.execute("""
-        INSERT OR REPLACE INTO capital_diario (fecha, capital_dia, tamano_objetivo, creado)
-        VALUES (?,?,?,?)
-    """, (hoy, capital_dia, tamano_objetivo, datetime.now(TZ_ARG).isoformat()))
+        INSERT OR REPLACE INTO capital_diario (fecha, capital_dia, tamano_objetivo, creado, es_fallback)
+        VALUES (?,?,?,?,?)
+    """, (hoy, capital_dia, tamano_objetivo, datetime.now(TZ_ARG).isoformat(), 1 if es_fallback else 0))
     conn.commit()
     conn.close()
 
 
 def obtener_capital_diario():
-    """Devuelve el registro de HOY o None si el recálculo de las 00:01 todavía no corrió."""
+    """Devuelve el registro de HOY (real o de respaldo) o None si todavía no hay ninguno."""
     conn = _conn()
     cur = conn.cursor()
     hoy = datetime.now(TZ_ARG).strftime("%Y%m%d")
@@ -1586,6 +1596,58 @@ def obtener_capital_diario():
     row = cur.fetchone()
     conn.close()
     return dict(row) if row else None
+
+
+def obtener_capital_diario_anterior():
+    """
+    30/09 — Devuelve el capital_dia REAL (es_fallback=0) más reciente de un
+    día ANTERIOR a hoy, para usar como respaldo mientras el recálculo de
+    hoy sigue pendiente (posiciones abiertas a las 00:01). Si no hay
+    ninguno real, devuelve el más reciente aunque sea de respaldo, para
+    no dejar el capital en None indefinidamente.
+    """
+    conn = _conn()
+    cur = conn.cursor()
+    hoy = datetime.now(TZ_ARG).strftime("%Y%m%d")
+    cur.execute("""
+        SELECT * FROM capital_diario
+        WHERE fecha < ? AND (es_fallback IS NULL OR es_fallback = 0)
+        ORDER BY fecha DESC LIMIT 1
+    """, (hoy,))
+    row = cur.fetchone()
+    if not row:
+        cur.execute("""
+            SELECT * FROM capital_diario WHERE fecha < ? ORDER BY fecha DESC LIMIT 1
+        """, (hoy,))
+        row = cur.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+# ── Estado del recálculo diario pendiente (tabla `config`) ──
+def obtener_config(clave: str):
+    conn = _conn()
+    cur = conn.cursor()
+    cur.execute("SELECT valor FROM config WHERE clave = ?", (clave,))
+    row = cur.fetchone()
+    conn.close()
+    return row["valor"] if row else None
+
+
+def guardar_config(clave: str, valor: str):
+    conn = _conn()
+    cur = conn.cursor()
+    cur.execute("INSERT OR REPLACE INTO config (clave, valor) VALUES (?, ?)", (clave, str(valor)))
+    conn.commit()
+    conn.close()
+
+
+def borrar_config(clave: str):
+    conn = _conn()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM config WHERE clave = ?", (clave,))
+    conn.commit()
+    conn.close()
 
 
 # ── Resúmenes básicos ────────────────────────────────────────

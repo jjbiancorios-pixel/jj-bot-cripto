@@ -1412,9 +1412,32 @@ def chequear_huerfanas():
 
 # ── Capital diario — 00:01 ARG, reintenta cada 1 min si hay abiertas ──
 def recalculo_diario_job():
+    # 30/09 — Al arrancar el día se limpia cualquier estado de "pendiente"/
+    # aviso que haya quedado de AYER (si el recálculo de ayer nunca llegó a
+    # resolverse como real, por ejemplo), para que el conteo de minutos
+    # pendientes de HOY empiece de cero y no herede horas de un día previo.
+    db.borrar_config(gestion_riesgo.CONFIG_PENDIENTE_DESDE)
+    db.borrar_config(gestion_riesgo.CONFIG_ULTIMO_AVISO)
     resultado = gestion_riesgo.intentar_recalculo_diario()
     if resultado:
         telegram_cmds.enviar(resultado)
+
+
+def recalculo_diario_retry_job():
+    """
+    30/09 — Reemplaza el reintento crudo de antes (que solo probaba el
+    recálculo real cuando había 0 posiciones abiertas, y por eso podía
+    quedar bloqueado un día entero). Ahora, además de reintentar el
+    recálculo real, activa un capital de RESPALDO con el valor de ayer
+    mientras se espera, y avisa por Telegram a los 60 min de estar
+    pendiente y luego cada 60 min hasta resolverse.
+    """
+    try:
+        resultado = gestion_riesgo.chequear_y_gestionar_recalculo_diario()
+        if resultado:
+            telegram_cmds.enviar(resultado)
+    except Exception as e:
+        print(f"⚠️ recalculo_diario_retry_job: {e}", flush=True)
 
 
 # ── Arranque ─────────────────────────────────────────────────
@@ -1429,7 +1452,7 @@ def main():
     schedule.every(15).minutes.do(ciclo_seleccion)
     schedule.every(30).minutes.do(chequear_huerfanas)
     schedule.every().day.at("00:01").do(recalculo_diario_job)
-    schedule.every(1).minutes.do(lambda: gestion_riesgo.intentar_recalculo_diario() if db.contar_posiciones_abiertas() == 0 and not db.obtener_capital_diario() else None)
+    schedule.every(1).minutes.do(recalculo_diario_retry_job)
 
     ciclo_principal = 0
     while True:
