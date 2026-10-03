@@ -168,6 +168,7 @@ def init_db():
     _migrar_columnas_nuevas(cur)
     _crear_tabla_candidatos_v55_ciclo(cur)
     _crear_tabla_sombra_ranked_v55(cur)
+    _crear_tabla_sombra_ranked_v55_opt(cur)
     _crear_tabla_simulaciones(cur)  # su backfill de capital_asignado necesita sombra_ranked_v55 ya creada
 
     conn.commit()
@@ -678,6 +679,120 @@ def cerrar_sombra_ranked_v55(id_: int, resultado_pct: float, motivo: str):
     ahora = datetime.now(TZ_ARG)
     cur.execute("""
         UPDATE sombra_ranked_v55 SET cerrado = 1, resultado_pct = ?, motivo_cierre = ?, fecha_cierre = ?, hora_cierre = ?
+        WHERE id = ?
+    """, (resultado_pct, motivo, ahora.strftime("%Y%m%d"), ahora.strftime("%H:%M"), id_))
+    conn.commit()
+    conn.close()
+
+
+# ── 03/10 — Directiva: sombra_ranked_v55_opt — mismo mecanismo que
+# sombra_ranked_v55 (trackea hasta el puesto 10 de cada ciclo, sin
+# tope), pero evaluada con la regla de salida PROPUESTA
+# (evaluar_cierre_v55_optimizado: activación 15%, retroceso 20%, mismo
+# SL -25%) en vez de la actual (5%/10%). Corre en paralelo, mismo
+# precio de entrada y mismo instante que sombra_ranked_v55 y que el
+# real, sin tocar ninguno de los dos — es pura observación adicional.
+# Trackear hasta el puesto 10 (no solo 1-2) permite, además de comparar
+# directo contra lo que real tradea (filtrando por posicion<=2 después),
+# repetir el mismo backtest de combinaciones A/M ya hecho para la regla
+# actual pero con la regla propuesta, una vez haya unos días de datos.
+TOP_SOMBRA_RANKED_V55_OPT = 10
+
+
+def _crear_tabla_sombra_ranked_v55_opt(cur):
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS sombra_ranked_v55_opt (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ciclo_ts TEXT NOT NULL,
+            fecha TEXT NOT NULL,
+            hora TEXT NOT NULL,
+            par TEXT NOT NULL,
+            direccion TEXT NOT NULL,
+            posicion INTEGER NOT NULL,
+            score REAL,
+            rsi_15m REAL,
+            precio_entrada REAL,
+            pico_maximo_pct REAL DEFAULT 0,
+            capital_asignado REAL,
+            cerrado INTEGER DEFAULT 0,
+            resultado_pct REAL,
+            motivo_cierre TEXT,
+            fecha_cierre TEXT,
+            hora_cierre TEXT,
+            creado TEXT NOT NULL
+        )
+    """)
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_sombra_ranked_v55_opt_par_cerrado ON sombra_ranked_v55_opt (par, cerrado)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_sombra_ranked_v55_opt_fecha ON sombra_ranked_v55_opt (fecha)")
+
+
+def par_tiene_sombra_ranked_v55_opt_abierta(par: str) -> bool:
+    conn = _conn()
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM sombra_ranked_v55_opt WHERE cerrado = 0 AND par = ?", (par,))
+    n = cur.fetchone()[0]
+    conn.close()
+    return n > 0
+
+
+def abrir_sombra_ranked_v55_opt_lote(candidatos_ordenados: list, top: int = TOP_SOMBRA_RANKED_V55_OPT):
+    """
+    Espejo de abrir_sombra_ranked_v55_lote, pero solo puestos 1..top
+    (default 2) y en su propia tabla/libro independiente — dedupe por
+    par separado del de sombra_ranked_v55 y del real, a propósito
+    (mismo patrón ya usado entre las 3 tablas existentes).
+    """
+    if not candidatos_ordenados:
+        return
+    conn = _conn()
+    cur = conn.cursor()
+    ahora = datetime.now(TZ_ARG)
+    ciclo_ts = ahora.isoformat()
+    fecha = ahora.strftime("%Y%m%d")
+    hora = ahora.strftime("%H:%M")
+    capital_asignado = _capital_asignado_estimado()
+    filas = []
+    for i, c in enumerate(candidatos_ordenados[:top], start=1):
+        par = c.get("par")
+        if par_tiene_sombra_ranked_v55_opt_abierta(par):
+            continue
+        filas.append((
+            ciclo_ts, fecha, hora, par, c.get("direccion"), i,
+            c.get("fuerza_score_v55"), c.get("rsi_15m"), c.get("precio"), capital_asignado, ciclo_ts,
+        ))
+    if filas:
+        cur.executemany("""
+            INSERT INTO sombra_ranked_v55_opt
+                (ciclo_ts, fecha, hora, par, direccion, posicion, score, rsi_15m, precio_entrada, capital_asignado, creado)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?)
+        """, filas)
+        conn.commit()
+    conn.close()
+
+
+def sombra_ranked_v55_opt_abiertas() -> list:
+    conn = _conn()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM sombra_ranked_v55_opt WHERE cerrado = 0")
+    rows = [dict(r) for r in cur.fetchall()]
+    conn.close()
+    return rows
+
+
+def actualizar_pico_sombra_ranked_v55_opt(id_: int, pico_nuevo: float):
+    conn = _conn()
+    cur = conn.cursor()
+    cur.execute("UPDATE sombra_ranked_v55_opt SET pico_maximo_pct = ? WHERE id = ?", (pico_nuevo, id_))
+    conn.commit()
+    conn.close()
+
+
+def cerrar_sombra_ranked_v55_opt(id_: int, resultado_pct: float, motivo: str):
+    conn = _conn()
+    cur = conn.cursor()
+    ahora = datetime.now(TZ_ARG)
+    cur.execute("""
+        UPDATE sombra_ranked_v55_opt SET cerrado = 1, resultado_pct = ?, motivo_cierre = ?, fecha_cierre = ?, hora_cierre = ?
         WHERE id = ?
     """, (resultado_pct, motivo, ahora.strftime("%Y%m%d"), ahora.strftime("%H:%M"), id_))
     conn.commit()

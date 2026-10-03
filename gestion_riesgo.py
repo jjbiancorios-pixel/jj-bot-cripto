@@ -309,6 +309,32 @@ def evaluar_cierre_v55(direccion: str, pico_maximo_pct: float, resultado_actual_
     return {"cerrar": False, "motivo": None, "pico_nuevo": pico_actual}
 
 
+# 03/10 — Directiva: regla de salida PROPUESTA a validar en paralelo
+# (sombra_ranked_v55_opt, puestos 1-2 únicamente). Mismo SL que V5.5
+# (-25%), pero trailing con activación más tardía (15% en vez de 5%) y
+# retroceso más amplio (20% en vez de 10%) — la idea a probar es dejar
+# correr más las ganancias antes de proteger. Función separada a
+# propósito: NO tocar evaluar_cierre_v55 (esa sigue siendo la que
+# corre con capital real y en sombra_ranked_v55/simulaciones_v55).
+SL_V55_OPT_PCT = SL_V55_PCT  # -25.0, sin cambios
+PICO_ACTIVACION_V55_OPT_PCT = 15.0
+RETROCESO_V55_OPT_PCT = 20
+
+
+def evaluar_cierre_v55_optimizado(direccion: str, pico_maximo_pct: float, resultado_actual_pct: float) -> dict:
+    """Idéntica estructura a evaluar_cierre_v55, con los parámetros propuestos de arriba."""
+    if resultado_actual_pct <= SL_V55_OPT_PCT:
+        return {"cerrar": True, "motivo": "stop_loss", "pico_nuevo": pico_maximo_pct}
+
+    pico_actual = max(pico_maximo_pct or 0, resultado_actual_pct)
+    if pico_actual >= PICO_ACTIVACION_V55_OPT_PCT:
+        piso_permitido = pico_actual * (1 - RETROCESO_V55_OPT_PCT / 100)
+        if resultado_actual_pct <= piso_permitido:
+            return {"cerrar": True, "motivo": "trailing_v55_opt", "pico_nuevo": pico_actual}
+
+    return {"cerrar": False, "motivo": None, "pico_nuevo": pico_actual}
+
+
 def evaluar_cierre_fix28_fiel(direccion: str, atr_pct: float, pico_maximo_pct: float, resultado_actual_pct: float,
                                precio_actual: float = None, rango_bajo: float = None, rango_alto: float = None,
                                fuera_rango_desde: str = None, btc_estado: str = None) -> dict:
