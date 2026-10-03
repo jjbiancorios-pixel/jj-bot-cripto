@@ -1357,9 +1357,12 @@ def chequeo_rapido_riesgo():
                 else:
                     db.actualizar_pico_sombra_ranked_v55(sim["id"], decision_sim["pico_nuevo"])
 
-            # ── 03/10 — Directiva: chequeo de sombra_ranked_v55_opt (puestos
-            # 1-2, regla de salida PROPUESTA 15%/20%) — mismo patrón que el
-            # bloque de arriba, en su propia tabla/libro, en paralelo. ──
+            # ── 03/10 — Directiva: chequeo de sombra_ranked_v55_opt (hasta
+            # puesto 10, regla de salida PROPUESTA 15%/20%) — mismo patrón
+            # que el bloque de arriba, en su propia tabla/libro, en paralelo.
+            # Con print específico para poder seguir en los logs de Railway,
+            # en vivo, cuándo una operación toca el nuevo objetivo y cuándo
+            # cierra por el trailing nuevo (a pedido de Juanjo, 03/10). ──
             for sim in db.sombra_ranked_v55_opt_abiertas():
                 precio_actual_sim = get_precio(sim["par"])
                 if precio_actual_sim is None:
@@ -1368,10 +1371,21 @@ def chequeo_rapido_riesgo():
                 signo = 1 if sim["direccion"] == "LARGO" else -1
                 resultado_actual_sim = cambio_precio_pct * signo * gestion_riesgo.LEVERAGE_FIJO
                 decision_sim = gestion_riesgo.evaluar_cierre_v55_optimizado(sim["direccion"], sim["pico_maximo_pct"], resultado_actual_sim)
+
+                pico_previo = sim["pico_maximo_pct"] or 0
+                pico_nuevo = decision_sim["pico_nuevo"]
+                if pico_previo < gestion_riesgo.PICO_ACTIVACION_V55_OPT_PCT <= pico_nuevo:
+                    print(f"🎯 [sombra_opt] {sim['par']} ({sim['direccion']}, puesto {sim['posicion']}) "
+                          f"TOCÓ el objetivo nuevo: pico {pico_nuevo:.2f}% >= {gestion_riesgo.PICO_ACTIVACION_V55_OPT_PCT}% "
+                          f"— activa trailing 20%% desde acá", flush=True)
+
                 if decision_sim["cerrar"]:
+                    print(f"✅ [sombra_opt] {sim['par']} ({sim['direccion']}, puesto {sim['posicion']}) "
+                          f"CERRÓ por '{decision_sim['motivo']}': resultado {resultado_actual_sim:+.2f}% "
+                          f"(pico alcanzado {pico_nuevo:.2f}%)", flush=True)
                     db.cerrar_sombra_ranked_v55_opt(sim["id"], resultado_actual_sim, decision_sim["motivo"])
                 else:
-                    db.actualizar_pico_sombra_ranked_v55_opt(sim["id"], decision_sim["pico_nuevo"])
+                    db.actualizar_pico_sombra_ranked_v55_opt(sim["id"], pico_nuevo)
 
             # ── 25/09: seguimiento post-cierre de V5.5 fiel — registra el precio
             # en checkpoints fijos (1/2/4/6/8/12hs) para cada cierre, sin afectar
