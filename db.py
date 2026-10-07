@@ -169,7 +169,9 @@ def init_db():
     _crear_tabla_candidatos_v55_ciclo(cur)
     _crear_tabla_sombra_ranked_v55(cur)
     _crear_tabla_sombra_ranked_v55_opt(cur)
+    _crear_tabla_candado_btc_log(cur)
     _crear_tabla_simulaciones(cur)  # su backfill de capital_asignado necesita sombra_ranked_v55 ya creada
+    _migrar_extremos_mae_mfe(cur)  # 07/10: MAE/MFE en sombras (después de que existan todas las tablas)
 
     conn.commit()
     conn.close()
@@ -521,7 +523,43 @@ def _crear_tabla_candidatos_v55_ciclo(cur):
     except Exception:
         pass  # ya existe
 
+    # 07/10 — Directiva: seguimiento de 1 a 12hs REACTIVADO y completado.
+    # Antes las columnas de checkpoint existían pero nada las llenaba (quedaron
+    # "superadas" por sombra_ranked_v55 y el worker se retiró): 3.070 filas con
+    # seguimiento_activo=1 y todo en NULL. Ahora procesar_seguimiento_candidatos_v55
+    # (main.py) las completa y además guarda la trayectoria: peor momento (MAE)
+    # y mejor momento (MFE) del resultado apalancado durante las 12hs, con el
+    # minuto en que ocurrieron (para saber cuál vino primero).
+    # bloqueado_btc_ema_legacy = 1 si la regla VIEJA del candado (solo EMA9/21
+    # de BTC, sin filtro de volatilidad) lo hubiera vetado; permite medir el
+    # impacto del filtro nuevo contra la regla anterior.
+    for nombre, tipo in (
+        ("peor_resultado_pct", "REAL"), ("mejor_resultado_pct", "REAL"),
+        ("peor_min", "INTEGER"), ("mejor_min", "INTEGER"),
+        ("ultimo_seguimiento", "TEXT"),
+        ("bloqueado_btc_ema_legacy", "INTEGER DEFAULT 0"),
+        ("btc_giro_ratio", "REAL"),
+    ):
+        try:
+            cur.execute(f"ALTER TABLE candidatos_v55_ciclo ADD COLUMN {nombre} {tipo}")
+        except Exception:
+            pass  # ya existe
+    # Filas que nunca se siguieron (ultimo_seguimiento NULL, de antes de este
+    # cambio o de un período con el bot caído): se cierran como abandonadas
+    # (terminado=2). Si se siguieran recién ahora, la trayectoria y el peor
+    # momento (MAE) quedarían incompletos y mezclados con datos buenos.
+    try:
+        limite = (datetime.now(TZ_ARG) - timedelta(minutes=2)).isoformat()
+        cur.execute("""
+            UPDATE candidatos_v55_ciclo SET terminado = 2
+            WHERE seguimiento_activo = 1 AND COALESCE(terminado, 0) = 0
+              AND ultimo_seguimiento IS NULL AND creado < ?
+        """, (limite,))
+    except Exception:
+        pass
 
+
+SEGUIMIENTO_CANDIDATOS_MAX_HORAS = 12
 TOP_SEGUIMIENTO_V55_CICLO = 10  # cuántos candidatos por ciclo (de arriba hacia abajo) reciben seguimiento de 12hs
 
 
@@ -558,13 +596,16 @@ def guardar_candidatos_v55_ciclo(candidatos_ordenados: list):
             i, 1 if c.get("ejecutado_real") else 0, c.get("precio"),
             1 if i <= TOP_SEGUIMIENTO_V55_CICLO else 0, ciclo_ts,
             1 if c.get("bloqueado_btc_macro") else 0,
+            1 if c.get("bloqueado_btc_ema_legacy") else 0,
+            c.get("btc_giro_ratio"),
         )
         for i, c in enumerate(candidatos_ordenados, start=1)
     ]
     cur.executemany("""
         INSERT INTO candidatos_v55_ciclo
-            (ciclo_ts, fecha, hora, par, direccion, rsi_15m, score, posicion, ejecutado, precio, seguimiento_activo, creado, bloqueado_btc_macro)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+            (ciclo_ts, fecha, hora, par, direccion, rsi_15m, score, posicion, ejecutado, precio, seguimiento_activo, creado, bloqueado_btc_macro,
+             bloqueado_btc_ema_legacy, btc_giro_ratio)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     """, filas)
     conn.commit()
     conn.close()
@@ -582,6 +623,183 @@ def guardar_candidatos_v55_ciclo(candidatos_ordenados: list):
 # CUALQUIER combinación de "N aperturas por ciclo / M tope simultáneo"
 # con datos reales de fidelidad completa, no una suposición.
 TOP_SOMBRA_RANKED_V55 = 10  # hasta qué posición del ranking se simula continuamente
+
+
+# ── 07/10 — MAE/MFE en las simulaciones y seguimiento de candidatos ──────
+TABLAS_CON_EXTREMOS = ("sombra_ranked_v55", "sombra_ranked_v55_opt", "simulaciones_v55")
+
+
+def _migrar_extremos_mae_mfe(cur):
+    """
+    07/10 — Directiva: guardar el peor (MAE) y mejor (MFE) resultado
+    apalancado que tocó cada simulación abierta, y en qué minuto desde la
+    apertura, para poder reconstruir después cualquier SL alternativo con
+    datos reales (antes solo existía en `senales`, no en las sombras).
+    """
+    for tabla in TABLAS_CON_EXTREMOS:
+        for nombre, tipo in (("peor_resultado_pct", "REAL"), ("mejor_resultado_pct", "REAL"),
+                             ("peor_min", "INTEGER"), ("mejor_min", "INTEGER")):
+            try:
+                cur.execute(f"ALTER TABLE {tabla} ADD COLUMN {nombre} {tipo}")
+            except Exception:
+                pass  # ya existe
+
+
+def actualizar_extremos_sim(tabla: str, fila: dict, resultado_actual: float):
+    """
+    Actualiza peor/mejor resultado de una simulación abierta SOLO si el
+    valor actual es un nuevo extremo (la fila ya trae los extremos previos,
+    así que casi nunca escribe — el costo en el hilo de 2seg es mínimo).
+    """
+    if tabla not in TABLAS_CON_EXTREMOS or resultado_actual is None:
+        return
+    peor = fila.get("peor_resultado_pct")
+    mejor = fila.get("mejor_resultado_pct")
+    nuevo_peor = peor is None or resultado_actual < peor
+    nuevo_mejor = mejor is None or resultado_actual > mejor
+    if not (nuevo_peor or nuevo_mejor):
+        return
+    try:
+        creado_dt = datetime.fromisoformat(fila["creado"])
+        minutos = int((datetime.now(TZ_ARG) - creado_dt).total_seconds() / 60)
+    except Exception:
+        minutos = None
+    sets, params = [], []
+    if nuevo_peor:
+        sets += ["peor_resultado_pct = ?", "peor_min = ?"]
+        params += [resultado_actual, minutos]
+    if nuevo_mejor:
+        sets += ["mejor_resultado_pct = ?", "mejor_min = ?"]
+        params += [resultado_actual, minutos]
+    params.append(fila["id"])
+    conn = _conn()
+    cur = conn.cursor()
+    cur.execute(f"UPDATE {tabla} SET {', '.join(sets)} WHERE id = ?", params)
+    conn.commit()
+    conn.close()
+    if nuevo_peor:
+        fila["peor_resultado_pct"] = resultado_actual
+    if nuevo_mejor:
+        fila["mejor_resultado_pct"] = resultado_actual
+
+
+CHECKPOINTS_CANDIDATOS_HORAS = (1, 2, 4, 6, 8, 12)
+TOLERANCIA_CHECKPOINT_HORAS = 0.25  # si el bot estuvo caído y se pasó >15min, el checkpoint queda NULL (no se rellena con un precio de otra hora)
+COLUMNAS_SEGUIMIENTO_CANDIDATOS = (
+    {f"precio_{h}h" for h in CHECKPOINTS_CANDIDATOS_HORAS}
+    | {f"resultado_{h}h_pct" for h in CHECKPOINTS_CANDIDATOS_HORAS}
+    | {"peor_resultado_pct", "mejor_resultado_pct", "peor_min", "mejor_min", "terminado", "ultimo_seguimiento"}
+)
+
+
+def candidatos_v55_seguimiento_pendientes() -> list:
+    """Candidatos con seguimiento activo, no terminados y dentro de la ventana de 12hs."""
+    limite = (datetime.now(TZ_ARG) - timedelta(hours=SEGUIMIENTO_CANDIDATOS_MAX_HORAS + 1)).isoformat()
+    conn = _conn()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT * FROM candidatos_v55_ciclo
+        WHERE seguimiento_activo = 1 AND COALESCE(terminado, 0) = 0 AND creado >= ?
+    """, (limite,))
+    rows = [dict(r) for r in cur.fetchall()]
+    conn.close()
+    return rows
+
+
+def candidatos_v55_cerrar_vencidos() -> int:
+    """Marca como terminado=2 (vencido sin completar) lo que pasó de la ventana."""
+    limite = (datetime.now(TZ_ARG) - timedelta(hours=SEGUIMIENTO_CANDIDATOS_MAX_HORAS + 1)).isoformat()
+    conn = _conn()
+    cur = conn.cursor()
+    cur.execute("""
+        UPDATE candidatos_v55_ciclo SET terminado = 2
+        WHERE seguimiento_activo = 1 AND COALESCE(terminado, 0) = 0 AND creado < ?
+    """, (limite,))
+    n = cur.rowcount
+    conn.commit()
+    conn.close()
+    return n
+
+
+def guardar_seguimiento_candidato(id_: int, campos: dict):
+    """UPDATE parcial con lista blanca de columnas (nunca arma SQL con claves externas)."""
+    campos = {k: v for k, v in campos.items() if k in COLUMNAS_SEGUIMIENTO_CANDIDATOS}
+    if not campos:
+        return
+    sets = ", ".join(f"{k} = ?" for k in campos)
+    conn = _conn()
+    cur = conn.cursor()
+    cur.execute(f"UPDATE candidatos_v55_ciclo SET {sets} WHERE id = ?", list(campos.values()) + [id_])
+    conn.commit()
+    conn.close()
+
+
+# ── 07/10 — Registro del Candado Macro de BTC (una fila por ciclo) ───────
+def _crear_tabla_candado_btc_log(cur):
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS candado_btc_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ciclo_ts TEXT NOT NULL,
+            fecha TEXT NOT NULL,
+            hora TEXT NOT NULL,
+            estado_ema TEXT,
+            giro_brusco INTEGER,          -- 1 activo, 0 apagado, NULL sin datos
+            atr15_pct REAL,               -- ATR(14) de 15m de BTC, en % del precio
+            mov_cerrada_pct REAL,         -- |close-open| última vela cerrada, en %
+            mov_actual_pct REAL,          -- |close-open| vela en formación, en %
+            ratio_cuerpo REAL,            -- max(mov)/ATR (lo que se compara con 2.5)
+            ratio_rango REAL,             -- max(high-low)/ATR (solo informativo)
+            direccion_giro TEXT,          -- ABAJO / ARRIBA de la vela que disparó
+            vetados_top2 INTEGER,         -- cuántos de los puestos 1-2 vetó el candado
+            vetados_legacy_top2 INTEGER,  -- cuántos habría vetado la regla vieja (sin filtro)
+            ejecutables INTEGER,          -- cuántos de los puestos 1-2 quedaron para abrir
+            motivo TEXT,
+            creado TEXT NOT NULL
+        )
+    """)
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_candado_btc_log_fecha ON candado_btc_log (fecha)")
+
+
+def guardar_candado_btc_log(btc: dict, vetados_top2: int, vetados_legacy_top2: int, ejecutables: int, motivo: str = ""):
+    try:
+        btc = btc or {}
+        conn = _conn()
+        cur = conn.cursor()
+        ahora = datetime.now(TZ_ARG)
+        g = btc.get("giro_brusco")
+        cur.execute("""
+            INSERT INTO candado_btc_log
+                (ciclo_ts, fecha, hora, estado_ema, giro_brusco, atr15_pct, mov_cerrada_pct, mov_actual_pct,
+                 ratio_cuerpo, ratio_rango, direccion_giro, vetados_top2, vetados_legacy_top2, ejecutables, motivo, creado)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """, (
+            ahora.isoformat(), ahora.strftime("%Y%m%d"), ahora.strftime("%H:%M"),
+            btc.get("estado"), None if g is None else (1 if g else 0),
+            btc.get("atr15_pct"), btc.get("mov_cerrada_pct"), btc.get("mov_actual_pct"),
+            btc.get("giro_ratio"), btc.get("giro_ratio_rango"), btc.get("giro_direccion"),
+            vetados_top2, vetados_legacy_top2, ejecutables, motivo, ahora.isoformat(),
+        ))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"Error guardando candado_btc_log: {e}")
+
+
+def resumen_candado_btc(desde_fecha: str) -> dict:
+    conn = _conn()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT COUNT(*) AS ciclos,
+               SUM(CASE WHEN giro_brusco = 1 THEN 1 ELSE 0 END) AS ciclos_giro,
+               SUM(CASE WHEN giro_brusco IS NULL THEN 1 ELSE 0 END) AS ciclos_sin_datos,
+               SUM(COALESCE(vetados_top2, 0)) AS vetados,
+               SUM(COALESCE(vetados_legacy_top2, 0)) AS vetados_legacy,
+               MAX(ratio_cuerpo) AS ratio_max
+        FROM candado_btc_log WHERE fecha >= ?
+    """, (desde_fecha,))
+    r = dict(cur.fetchone())
+    conn.close()
+    return r
 
 
 def _crear_tabla_sombra_ranked_v55(cur):

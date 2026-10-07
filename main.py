@@ -288,6 +288,11 @@ def aplicar_ranking_de_fuerza_v52(candidatos_calificados_ciclo: list) -> list:
     return candidatos_ordenados[:2]
 
 
+# 07/10 — Último resumen del candado para el log por ciclo (lo escribe
+# aplicar_ranking_v55, lo guarda ciclo_seleccion junto con el estado de BTC).
+RESUMEN_CANDADO_CICLO = {"vetados": 0, "vetados_legacy": 0, "ejecutables": 0, "motivo": ""}
+
+
 def aplicar_ranking_v55(candidatos_calificados_ciclo: list) -> list:
     """
     24/09 — Directiva V5.5 ("Estrategia Simplificada"), provista por
@@ -309,6 +314,7 @@ def aplicar_ranking_v55(candidatos_calificados_ciclo: list) -> list:
     toman los 2 mejores del ciclo de 15 minutos — mismo patrón de
     selección que V5.2, ranking distinto.
     """
+    RESUMEN_CANDADO_CICLO.update({"vetados": 0, "vetados_legacy": 0, "ejecutables": 0, "motivo": "sin candidatos"})
     if not candidatos_calificados_ciclo:
         return []
 
@@ -333,8 +339,24 @@ def aplicar_ranking_v55(candidatos_calificados_ciclo: list) -> list:
     # después si bloquearlos fue una mejora real. `ejecutado_real` (no
     # la posición cruda) es lo que decide qué se marca como ejecutado
     # en la base, para no mentir sobre qué se mandó a capital real.
-    candidatos_no_bloqueados = [c for c in candidatos_ordenados if not c.get("bloqueado_btc_macro")]
-    top2_reales = candidatos_no_bloqueados[:2]
+    #
+    # 07/10 — Directiva (REEMPLAZA a lo anterior): se elimina la regla de
+    # reemplazo. Antes, si el candado vetaba a un puesto 1 o 2, entraba el
+    # siguiente no bloqueado (puestos 3, 4...), que históricamente pierden
+    # dinero. Ahora el corte REAL se toma SOLO de los 2 primeros puestos
+    # crudos del ranking; si el candado veta a alguno, ese cupo queda VACÍO
+    # (0 órdenes si veta a los dos). Los puestos 3+ nunca abren con capital
+    # real, pase lo que pase con el candado.
+    for i, c in enumerate(candidatos_ordenados, start=1):
+        c["posicion_ranking"] = i
+    top2_crudo = candidatos_ordenados[:gestion_riesgo.MAX_PUESTO_REAL]
+    top2_reales = [c for c in top2_crudo if not c.get("bloqueado_btc_macro")]
+    RESUMEN_CANDADO_CICLO.update({
+        "vetados": len(top2_crudo) - len(top2_reales),
+        "vetados_legacy": sum(1 for c in top2_crudo if c.get("bloqueado_btc_ema_legacy")),
+        "ejecutables": len(top2_reales),
+        "motivo": "candado vetó puesto(s) sin reemplazo" if len(top2_reales) < len(top2_crudo) else "",  # si hay giro brusco lo reemplaza registrar_candado_btc_ciclo
+    })
     ids_top2_reales = {id(c) for c in top2_reales}
     for c in candidatos_ordenados:
         c["ejecutado_real"] = id(c) in ids_top2_reales
@@ -496,16 +518,73 @@ def calcular_grillas_wrapper(rango_pct):
 
 
 # ── BTC — contexto general ──────────────────────────────────
-def analizar_btc():
+def evaluar_giro_brusco_btc() -> dict:
+    """
+    07/10 — Directiva: filtro de volatilidad del Candado Macro de BTC.
+    El candado solo actúa si Bitcoin hace un movimiento violento (y, cuando
+    actúa, suspende el ciclo COMPLETO: Emisión = 0, ambas direcciones): el cuerpo (|close-open|) de la última vela de 15m cerrada o de
+    la vela actual en formación supera BTC_GIRO_ATR_MULT (2.5) x ATR(14) de 15m.
+    El ATR se calcula solo con velas CERRADAS (la última fila que devuelven
+    los exchanges es la vela en formación). Se mira también la vela en
+    formación porque el ciclo corre cada ~15min y un giro de hace 10 minutos
+    ya cerrado, o uno que recién empieza, no pueden quedar sin ver.
+    Sin datos de BTC -> giro_brusco=None y el candado queda APAGADO (misma
+    política fail-open que ya tenía: no frenar todo el bot por un bache de datos).
+    También se guarda el ratio con el rango (high-low) solo informativo.
+    """
+    vacio = {"giro_brusco": None, "giro_ratio": None, "giro_ratio_rango": None, "giro_direccion": None, "giro_motivo": None,
+             "atr15_pct": None, "mov_cerrada_pct": None, "mov_actual_pct": None}
+    try:
+        periodo = gestion_riesgo.BTC_GIRO_ATR_PERIODO
+        df = get_velas("BTCUSDT", gestion_riesgo.BTC_GIRO_TF, 60)
+        if df is None or len(df) < periodo + 3:
+            return vacio
+        cerradas = df.iloc[:-1].reset_index(drop=True)
+        atr = calc_atr(cerradas, periodo)
+        precio = float(cerradas["close"].iloc[-1])
+        if not (atr > 0) or precio <= 0 or atr != atr:
+            return vacio
+        v_cerr = cerradas.iloc[-1]
+        v_act = df.iloc[-1]
+        cuerpo_cerr = abs(float(v_cerr["close"]) - float(v_cerr["open"]))
+        cuerpo_act = abs(float(v_act["close"]) - float(v_act["open"]))
+        rango_cerr = float(v_cerr["high"]) - float(v_cerr["low"])
+        rango_act = float(v_act["high"]) - float(v_act["low"])
+        ratio_cuerpo = max(cuerpo_cerr, cuerpo_act) / atr
+        ratio_rango = max(rango_cerr, rango_act) / atr
+        dominante = v_cerr if cuerpo_cerr >= cuerpo_act else v_act
+        direccion = "ABAJO" if float(dominante["close"]) < float(dominante["open"]) else "ARRIBA"
+        # 07/10 — el peligro se define SOLO por el signo de la vela que disparó:
+        # cierre < apertura = riesgo de caída generalizada; cierre > apertura =
+        # riesgo de short-squeeze o volatilidad extrema.
+        motivo = ("BLOQUEO TOTAL: vela bajista violenta, riesgo de caída generalizada" if direccion == "ABAJO"
+                  else "BLOQUEO TOTAL: vela alcista violenta, riesgo de short-squeeze o volatilidad extrema")
+        return {
+            "giro_brusco": bool(ratio_cuerpo > gestion_riesgo.BTC_GIRO_ATR_MULT),
+            "giro_ratio": round(ratio_cuerpo, 3),
+            "giro_ratio_rango": round(ratio_rango, 3),
+            "giro_direccion": direccion,
+            "giro_motivo": motivo,
+            "atr15_pct": round(atr / precio * 100, 4),
+            "mov_cerrada_pct": round(cuerpo_cerr / precio * 100, 4),
+            "mov_actual_pct": round(cuerpo_act / precio * 100, 4),
+        }
+    except Exception as e:
+        print(f"evaluar_giro_brusco_btc: {e}", flush=True)
+        return vacio
+
+
+def analizar_btc(con_giro: bool = True):
     """
     10/09 — Se agregó detección de "cambio reciente" de tendencia (mismo
     principio que la persistencia de 3 velas ya usada para cada moneda,
     aplicado acá al contexto de BTC) — sirve para activar el modo cauto
     de exposición direccional (ver actualizar_modo_cauto_btc).
     """
+    giro = evaluar_giro_brusco_btc() if con_giro else {}
     df = get_velas("BTCUSDT", "1h", 100)
     if df is None:
-        return {"estado": "SIN_DATO", "cambio_1h_pct": 0, "cambio_reciente": False, "persistio_3": False}
+        return {"estado": "SIN_DATO", "cambio_1h_pct": 0, "cambio_reciente": False, "persistio_3": False, **giro}
     ema9_serie = df["close"].ewm(span=9).mean()
     ema21_serie = df["close"].ewm(span=21).mean()
     ema9 = float(ema9_serie.iloc[-1])
@@ -527,7 +606,7 @@ def analizar_btc():
     persistio_3 = bool((np.sign(diff_serie.iloc[-3:]) == signo_ahora).all())
 
     return {"estado": estado, "cambio_1h_pct": round(cambio_1h_pct, 3),
-            "cambio_reciente": cambio_reciente, "persistio_3": persistio_3}
+            "cambio_reciente": cambio_reciente, "persistio_3": persistio_3, **giro}
 
 
 def actualizar_modo_cauto_btc(btc: dict):
@@ -625,10 +704,20 @@ def analizar_par_v5(par: str, btc: dict):
     # aplicar_ranking_v55, para poder medir el impacto con datos antes
     # de confiar en el candado a ciegas.
     estado_btc = btc.get("estado") if btc else None
-    bloqueado_btc_macro = (
+    # 07/10 — Directiva: el candado ya NO actúa en cada ciclo ni por dirección.
+    # Solo se enciende con un giro brusco de BTC (vela de 15m > 2.5 x ATR, ver
+    # evaluar_giro_brusco_btc) y, cuando se enciende, suspende el ciclo
+    # COMPLETO: todos los candidatos quedan vetados, LARGO y CORTO por igual
+    # (la EMA de 1h llega tarde justo en estos giros, así que ya no decide la
+    # dirección). Sin giro brusco, o sin datos de BTC, el candado está apagado.
+    # La regla anterior (veto por EMA, sin filtro) se sigue calculando y
+    # guardando como bloqueado_btc_ema_legacy, solo para medir la diferencia.
+    bloqueado_btc_ema_legacy = (
         (direccion == "LARGO" and estado_btc == "BAJISTA")
         or (direccion == "CORTO" and estado_btc == "ALCISTA")
     )
+    candado_btc_activo = bool(btc and btc.get("giro_brusco") is True)
+    bloqueado_btc_macro = candado_btc_activo
 
     # Persistencia (se mantiene, sin cambios respecto al diseño anterior)
     ema9_serie = df1h["close"].ewm(span=9).mean()
@@ -684,7 +773,9 @@ def analizar_par_v5(par: str, btc: dict):
         "par": par, "direccion": direccion, "precio": precio,
         "adx": round(adx, 2), "rsi": round(rsi_15m, 2), "atr_pct": round(atr_pct, 3),
         "rsi_15m": rsi_15m, "pendiente_rsi": pendiente_rsi,  # 20/09 — Directiva V5.2 (Ranking de Fuerza)
-        "bloqueado_btc_macro": bloqueado_btc_macro,  # 28/09 — Candado de Tendencia Macro
+        "bloqueado_btc_macro": bloqueado_btc_macro,  # 28/09 — Candado de Tendencia Macro (07/10: solo con giro brusco de BTC)
+        "bloqueado_btc_ema_legacy": bloqueado_btc_ema_legacy,  # 07/10 — lo que habría vetado la regla vieja, sin filtro
+        "btc_giro_ratio": (btc or {}).get("giro_ratio"),
         "score": 10, "razones": [f"V5.0: ADX(1h)={round(adx,1)} RSI(15m)={round(rsi_15m,1)}"],
         "rango_pct": grid["rango_pct"], "rango_bajo": round(grid["bottom"], 6),
         "rango_alto": round(grid["top"], 6), "grillas": grid["grillas"],
@@ -926,6 +1017,39 @@ def abrir_posicion_real(candidato: dict):
 
 
 # ── Ciclo de selección (cada 15 min) ────────────────────────
+_ULTIMO_GIRO_BTC = {"activo": None}
+
+
+def registrar_candado_btc_ciclo(btc: dict):
+    """
+    07/10 — Guarda una fila por ciclo en candado_btc_log (estado de BTC, ratio
+    contra el ATR, cuántos puestos 1-2 vetó el candado y cuántos habría vetado
+    la regla vieja) y avisa por Telegram solo cuando el candado se enciende o
+    se apaga, para no spamear.
+    """
+    try:
+        r = RESUMEN_CANDADO_CICLO
+        motivo = r["motivo"]
+        if btc and btc.get("giro_brusco") is True:
+            motivo = btc.get("giro_motivo") or "BLOQUEO TOTAL por giro brusco de BTC"
+        db.guardar_candado_btc_log(btc, r["vetados"], r["vetados_legacy"], r["ejecutables"], motivo)
+        activo = btc.get("giro_brusco") if btc else None
+        previo = _ULTIMO_GIRO_BTC["activo"]
+        if activo is not None and previo is not None and activo != previo:
+            if activo:
+                telegram_cmds.enviar(
+                    f"🔒 Candado BTC ACTIVADO: {btc.get('giro_motivo')} "
+                    f"(vela hacia {btc.get('giro_direccion')}, {btc.get('giro_ratio')}x ATR 15m, umbral {gestion_riesgo.BTC_GIRO_ATR_MULT}x). "
+                    f"Ciclo suspendido: no se abre ninguna orden real, ni LARGO ni CORTO."
+                )
+            else:
+                telegram_cmds.enviar("🔓 Candado BTC apagado: BTC volvió a su rango normal de volatilidad.")
+        if activo is not None:
+            _ULTIMO_GIRO_BTC["activo"] = activo
+    except Exception as e:
+        print(f"registrar_candado_btc_ciclo: {e}", flush=True)
+
+
 def ciclo_seleccion():
     """
     05/09 FIX (mismo bug encontrado en PAXG): antes, estar en pausa
@@ -1040,8 +1164,15 @@ def ciclo_seleccion():
     # del ciclo son los que abren con capital real cuando el bot está
     # activo.
     mejores_v55 = aplicar_ranking_v55(candidatos_v5_calificados)
+    registrar_candado_btc_ciclo(btc)
     for candidato_v55 in mejores_v55:
         par = candidato_v55["par"]
+        # 07/10 — Guarda dura: ningún puesto superior al 2 abre jamás, ni en
+        # sombra de la real ni con capital real, aunque alguien cambie el
+        # corte de arriba por error.
+        if candidato_v55.get("posicion_ranking", 99) > gestion_riesgo.MAX_PUESTO_REAL:
+            print(f"🚫 {par}: puesto {candidato_v55.get('posicion_ranking')} > {gestion_riesgo.MAX_PUESTO_REAL}, no abre", flush=True)
+            continue
         # "V5.5" — SIEMPRE recopila (de los 2 mejores), sin importar la
         # pausa. 24/09: ahora respeta el MISMO tope que tendría operando
         # real — 6 simulaciones abiertas a la vez y 2 aperturas nuevas
@@ -1120,6 +1251,79 @@ def procesar_seguimiento_post_cierre_v55():
                     db.marcar_seguimiento_v55_terminado(seg["id"])
 
 
+_SEGUIMIENTO_CANDIDATOS_ESTADO = {"ultimo": 0.0}
+SEGUIMIENTO_CANDIDATOS_INTERVALO_SEG = 20
+
+
+def procesar_seguimiento_candidatos_v55():
+    """
+    07/10 — Directiva: repara el seguimiento de 1 a 12hs de
+    candidatos_v55_ciclo, que estaba vacío (el worker original se retiró
+    cuando apareció sombra_ranked_v55 pero las columnas y el flag
+    seguimiento_activo siguieron existiendo). Para cada candidato de los
+    puestos 1-10 de cada ciclo, durante 12hs:
+
+      * guarda el resultado hipotético apalancado (10x, signo según
+        dirección) en los checkpoints de 1/2/4/6/8/12hs (precio_Xh,
+        resultado_Xh_pct);
+      * guarda el PEOR (MAE) y MEJOR (MFE) resultado visto en toda la
+        ventana, con el minuto en que ocurrió cada uno (peor_min /
+        mejor_min), muestreando cada ~20seg.
+
+    Un solo pedido de precio por PAR por vuelta (aunque haya varios
+    candidatos del mismo par). Si el bot estuvo caído y un checkpoint se
+    pasó por más de 15min, queda NULL en vez de rellenarse con un precio de
+    otra hora. Al cumplirse las 12hs la fila queda terminado=1; las que
+    vencen sin completarse quedan terminado=2.
+    """
+    ahora_t = time.time()
+    if ahora_t - _SEGUIMIENTO_CANDIDATOS_ESTADO["ultimo"] < SEGUIMIENTO_CANDIDATOS_INTERVALO_SEG:
+        return
+    _SEGUIMIENTO_CANDIDATOS_ESTADO["ultimo"] = ahora_t
+
+    db.candidatos_v55_cerrar_vencidos()
+    pendientes = db.candidatos_v55_seguimiento_pendientes()
+    if not pendientes:
+        return
+
+    precios = {}
+    for par in {c["par"] for c in pendientes}:
+        precios[par] = get_precio(par)
+
+    ahora = datetime.now(TZ_ARG)
+    horas_checkpoints = db.CHECKPOINTS_CANDIDATOS_HORAS
+    for c in pendientes:
+        precio = precios.get(c["par"])
+        entrada = c.get("precio")
+        if not precio or not entrada or entrada <= 0:
+            continue
+        try:
+            creado_dt = datetime.fromisoformat(c["creado"])
+        except Exception:
+            db.guardar_seguimiento_candidato(c["id"], {"terminado": 2})
+            continue
+        horas = (ahora - creado_dt).total_seconds() / 3600
+        minutos = int(horas * 60)
+        signo = 1 if c["direccion"] == "LARGO" else -1
+        resultado = (precio - entrada) / entrada * 100 * signo * gestion_riesgo.LEVERAGE_FIJO
+
+        cambios = {"ultimo_seguimiento": ahora.isoformat()}
+        peor, mejor = c.get("peor_resultado_pct"), c.get("mejor_resultado_pct")
+        if peor is None or resultado < peor:
+            cambios.update({"peor_resultado_pct": resultado, "peor_min": minutos})
+        if mejor is None or resultado > mejor:
+            cambios.update({"mejor_resultado_pct": resultado, "mejor_min": minutos})
+
+        for h in horas_checkpoints:
+            if c.get(f"precio_{h}h") is None and horas >= h and (horas - h) <= db.TOLERANCIA_CHECKPOINT_HORAS:
+                cambios[f"precio_{h}h"] = precio
+                cambios[f"resultado_{h}h_pct"] = resultado
+
+        if horas >= max(horas_checkpoints):
+            cambios["terminado"] = 1
+        db.guardar_seguimiento_candidato(c["id"], cambios)
+
+
 # ── Chequeo rápido de SL/trailing — DIRECTO a Pionex, cada 2seg ────
 def chequeo_rapido_riesgo():
     """
@@ -1138,7 +1342,7 @@ def chequeo_rapido_riesgo():
             # a la cascada externa sin ninguna pérdida real de precisión.
             if ciclo_n - btc_cache["ciclo_actualizado"] >= 30:
                 try:
-                    btc_cache["estado"] = analizar_btc()["estado"]
+                    btc_cache["estado"] = analizar_btc(con_giro=False)["estado"]
                     btc_cache["ciclo_actualizado"] = ciclo_n
                 except Exception:
                     pass  # se sigue usando el valor cacheado anterior si falla
@@ -1327,6 +1531,7 @@ def chequeo_rapido_riesgo():
                 signo = 1 if sim["direccion"] == "LARGO" else -1
                 resultado_actual_sim = cambio_precio_pct * signo * gestion_riesgo.LEVERAGE_FIJO
                 decision_sim = gestion_riesgo.evaluar_cierre_v55(sim["direccion"], sim["pico_maximo_pct"], resultado_actual_sim)
+                db.actualizar_extremos_sim("simulaciones_v55", sim, resultado_actual_sim)  # 07/10 MAE/MFE
                 if decision_sim["cerrar"]:
                     db.cerrar_simulacion_v55(sim["id"], resultado_actual_sim, decision_sim["motivo"])
                     # 25/09 — Arranca el seguimiento post-cierre (12hs, checkpoints
@@ -1352,6 +1557,7 @@ def chequeo_rapido_riesgo():
                 signo = 1 if sim["direccion"] == "LARGO" else -1
                 resultado_actual_sim = cambio_precio_pct * signo * gestion_riesgo.LEVERAGE_FIJO
                 decision_sim = gestion_riesgo.evaluar_cierre_v55(sim["direccion"], sim["pico_maximo_pct"], resultado_actual_sim)
+                db.actualizar_extremos_sim("sombra_ranked_v55", sim, resultado_actual_sim)  # 07/10 MAE/MFE
                 if decision_sim["cerrar"]:
                     db.cerrar_sombra_ranked_v55(sim["id"], resultado_actual_sim, decision_sim["motivo"])
                 else:
@@ -1371,6 +1577,7 @@ def chequeo_rapido_riesgo():
                 signo = 1 if sim["direccion"] == "LARGO" else -1
                 resultado_actual_sim = cambio_precio_pct * signo * gestion_riesgo.LEVERAGE_FIJO
                 decision_sim = gestion_riesgo.evaluar_cierre_v55_optimizado(sim["direccion"], sim["pico_maximo_pct"], resultado_actual_sim)
+                db.actualizar_extremos_sim("sombra_ranked_v55_opt", sim, resultado_actual_sim)  # 07/10 MAE/MFE
 
                 pico_previo = sim["pico_maximo_pct"] or 0
                 pico_nuevo = decision_sim["pico_nuevo"]
@@ -1391,6 +1598,11 @@ def chequeo_rapido_riesgo():
             # en checkpoints fijos (1/2/4/6/8/12hs) para cada cierre, sin afectar
             # el resultado ya guardado. Corre en el mismo hilo de 2seg. ──
             procesar_seguimiento_post_cierre_v55()
+
+            # ── 07/10: seguimiento de 1 a 12hs de TODOS los candidatos del
+            # ranking (puestos 1-10 de cada ciclo): trayectoria + peor/mejor
+            # momento. Corre cada ~20seg, no cada 2seg. ──
+            procesar_seguimiento_candidatos_v55()
         except Exception as e:
             print(f"⚠️ chequeo_rapido_riesgo: {e}", flush=True)
         time.sleep(2)

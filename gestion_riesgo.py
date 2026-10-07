@@ -29,6 +29,18 @@ MAX_APERTURAS_POR_CICLO = 2
 PCT_CAPITAL_POR_OPERACION = 0.05  # 5% del capital del día
 LEVERAGE_FIJO = 10
 
+# 07/10 — Directiva: Candado Macro de BTC con filtro de volatilidad.
+# El candado solo puede vetar los puestos 1-2 si la vela de 15m de BTCUSDT
+# (la última cerrada o la actual en formación) se mueve más de
+# BTC_GIRO_ATR_MULT x ATR(BTC_GIRO_ATR_PERIODO) de 15m. Fuera de eso el
+# candado está apagado y el bot opera los puestos 1-2 sin trabas.
+BTC_GIRO_TF = "15m"
+BTC_GIRO_ATR_PERIODO = 14
+BTC_GIRO_ATR_MULT = 2.5
+# Puesto máximo del ranking que puede abrir con capital real. Nunca se rellena
+# con puestos inferiores cuando el candado veta a uno de los dos primeros.
+MAX_PUESTO_REAL = 2
+
 # 06/09: escalados junto con el nuevo SL más ancho (-7.5%, antes -4%) —
 # mismo criterio proporcional, para que el trailing no quede corto
 # frente a un SL mucho más ancho (eso ya vimos que empeora la relación
