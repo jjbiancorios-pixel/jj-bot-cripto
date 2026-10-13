@@ -10,7 +10,8 @@ Comandos:
   /capital       — capital del día (interés compuesto)
   /pausar_todo [motivo] / /reanudar_todo
   /probar_pionex PAR PRECIO [LEVERAGE] [CAPITAL]
-  /backup_db     — manda el archivo completo de la base por Telegram
+  /backup_db     — manda la base completa comprimida (.gz); '/backup_db liviano' = sin gates_log
+  /diagnostico_db — qué ocupa espacio en el Volume (solo lectura)
   /gates PAR     — últimos chequeos de gates para un par (diagnóstico)
   /ayuda
 """
@@ -234,26 +235,107 @@ def _cmd_diagnostico_apertura() -> str:
         return f"⚠️ Error en el diagnóstico: {e}"
 
 
-def _cmd_backup_db() -> str:
+def _cmd_backup_db(args=None) -> str:
+    """
+    12/10 — /backup_db         : base completa comprimida (gzip).
+            /backup_db liviano : base sin gates_log, comprimida.
+    Telegram limita a 50 MB por archivo de bot; por eso se comprime y se usa
+    una copia consistente (API backup de SQLite) en vez de leer el archivo vivo.
+    """
+    import sqlite3, gzip, tempfile, shutil
     if not os.path.exists(db.DB_PATH):
         return "⚠️ No encontré la base de datos en el servidor."
-    try:
-        with open(db.DB_PATH, "rb") as f:
-            contenido = f.read()
-    except Exception as e:
-        return f"⚠️ No pude leer el archivo: {e}"
+    liviano = bool(args) and args[0].lower() in ("liviano", "light", "lite")
     fecha = datetime.now(db.TZ_ARG).strftime("%Y%m%d_%H%M")
-    nombre_archivo = f"bot_cripto_backup_{fecha}.db"
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendDocument"
-    files = {"document": (nombre_archivo, contenido, "application/x-sqlite3")}
-    data = {"chat_id": CHAT_ID, "caption": f"💾 Backup — {len(contenido)/1024:.1f} KB"}
+    tmpdir = tempfile.mkdtemp(prefix="bk_")
     try:
-        r = requests.post(url, data=data, files=files, timeout=60)
+        copia = os.path.join(tmpdir, "copia.db")
+        src = sqlite3.connect(f"file:{db.DB_PATH}?mode=ro", uri=True, timeout=30)
+        dst = sqlite3.connect(copia)
+        src.backup(dst)
+        src.close()
+        if liviano:
+            dst.execute("DROP TABLE IF EXISTS gates_log")
+            dst.commit()
+            dst.execute("VACUUM")
+        dst.close()
+        with open(copia, "rb") as f:
+            crudo = f.read()
+        comprimido = gzip.compress(crudo, compresslevel=6)
+        tag = "liviano_" if liviano else ""
+        nombre_archivo = f"bot_cripto_backup_{tag}{fecha}.db.gz"
+        if len(comprimido) > 49 * 1024 * 1024:
+            return (f"⚠️ Incluso comprimido pesa {len(comprimido)/1048576:.1f} MB "
+                    f"(límite Telegram 50 MB). Probá <code>/backup_db liviano</code>.")
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendDocument"
+        files = {"document": (nombre_archivo, comprimido, "application/gzip")}
+        data = {"chat_id": CHAT_ID,
+                "caption": (f"💾 Backup {'LIVIANO (sin gates_log)' if liviano else 'completo'} — "
+                            f"{len(comprimido)/1048576:.1f} MB comprimido "
+                            f"({len(crudo)/1048576:.1f} MB original). Descomprimir con gunzip.")}
+        r = requests.post(url, data=data, files=files, timeout=180)
         if not r.json().get("ok"):
             return f"⚠️ Falló el envío: {r.json()}"
         return None
     except Exception as e:
         return f"⚠️ Error: {e}"
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def _cmd_diagnostico_db() -> str:
+    """
+    08/10 — Diagnostico de espacio (solo lectura): que ocupa el Volume de
+    Railway. Muestra archivos de la carpeta de la base, tamano por tabla y
+    filas de gates_log por dia. No modifica nada.
+    """
+    import sqlite3
+    ruta = db.DB_PATH
+    carpeta = os.path.dirname(ruta) or "."
+    out = ["<b>Diagnóstico de la base</b>"]
+    try:
+        archivos = []
+        for nombre in os.listdir(carpeta):
+            fp = os.path.join(carpeta, nombre)
+            if os.path.isfile(fp):
+                archivos.append((os.path.getsize(fp), nombre))
+        archivos.sort(reverse=True)
+        total = sum(a for a, _ in archivos)
+        out.append(f"Carpeta {carpeta}: {total/1e6:.1f} MB en {len(archivos)} archivo(s)")
+        for tam, nombre in archivos[:6]:
+            out.append(f"  {nombre}: {tam/1e6:.1f} MB")
+    except Exception as e:
+        out.append(f"No pude listar la carpeta: {e}")
+    try:
+        conn = sqlite3.connect(ruta)
+        cur = conn.cursor()
+        try:
+            filas = cur.execute(
+                "SELECT name, SUM(pgsize) AS s FROM dbstat GROUP BY name ORDER BY s DESC LIMIT 8"
+            ).fetchall()
+            out.append("Por tabla/índice (MB):")
+            for nombre, tam in filas:
+                out.append(f"  {nombre}: {tam/1e6:.2f}")
+        except Exception:
+            out.append("Por tabla (filas):")
+            tablas = [r[0] for r in cur.execute("SELECT name FROM sqlite_master WHERE type='table'")]
+            cuentas = []
+            for t in tablas:
+                try:
+                    cuentas.append((cur.execute(f'SELECT COUNT(*) FROM "{t}"').fetchone()[0], t))
+                except Exception:
+                    pass
+            for n, t in sorted(cuentas, reverse=True)[:8]:
+                out.append(f"  {t}: {n}")
+        try:
+            g = cur.execute("SELECT fecha, COUNT(*) FROM gates_log GROUP BY fecha ORDER BY fecha DESC LIMIT 5").fetchall()
+            out.append("gates_log filas/día (últimos 5): " + ", ".join(f"{f[-4:]}={n}" for f, n in g))
+        except Exception:
+            pass
+        conn.close()
+    except Exception as e:
+        out.append(f"No pude abrir la base: {e}")
+    return "\n".join(out)
 
 
 def _cmd_debug_orden(args: list) -> str:
@@ -845,7 +927,9 @@ def procesar_comando(texto: str) -> str:
     elif cmd == "/diagnostico_apertura":
         return _cmd_diagnostico_apertura()
     elif cmd == "/backup_db":
-        return _cmd_backup_db()
+        return _cmd_backup_db(args)
+    elif cmd == "/diagnostico_db":
+        return _cmd_diagnostico_db()
     elif cmd == "/gates":
         return _cmd_gates(args)
     elif cmd == "/detalle_v55":
@@ -912,7 +996,8 @@ def procesar_comando(texto: str) -> str:
             "/pausar_todo [motivo] — frena aperturas nuevas (SL/trailing sigue activo)\n"
             "/reanudar_todo\n"
             "/probar_pionex PAR PRECIO — prueba conexión sin crear orden real\n"
-            "/backup_db — manda la base de datos completa por Telegram"
+            "/backup_db — base completa comprimida (.gz)\n/backup_db liviano — sin gates_log (más chica)\n"
+            "/diagnostico_db — qué ocupa espacio en el Volume (solo lectura)"
         )
     return f"⚠️ No reconozco el comando \"{cmd}\" — mandá /ayuda para ver la lista."
 
