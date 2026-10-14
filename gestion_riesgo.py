@@ -37,6 +37,12 @@ LEVERAGE_FIJO = 10
 BTC_GIRO_TF = "15m"
 BTC_GIRO_ATR_PERIODO = 14
 BTC_GIRO_ATR_MULT = 2.5
+
+# 14/10 — FILTRO "BTC EN CONTRA" (SOLO SOMBRA, no bloquea nada): marca un candidato
+# si BTC se movio >= este % EN CONTRA de su direccion en las ultimas 3 velas de 1h
+# cerradas (corto tras suba de BTC, largo tras baja). Hipotesis a validar con datos
+# reales: ver /filtro_btc. Para ACTIVARLO habria que usar el flag en aplicar_ranking_v55.
+FILTRO_BTC_CONTRA_3H_PCT = 0.7
 # Puesto máximo del ranking que puede abrir con capital real. Nunca se rellena
 # con puestos inferiores cuando el candado veta a uno de los dos primeros.
 MAX_PUESTO_REAL = 2

@@ -172,6 +172,7 @@ def init_db():
     _crear_tabla_candado_btc_log(cur)
     _crear_tabla_simulaciones(cur)  # su backfill de capital_asignado necesita sombra_ranked_v55 ya creada
     _migrar_extremos_mae_mfe(cur)  # 07/10: MAE/MFE en sombras (después de que existan todas las tablas)
+    _migrar_filtro_btc_contra(cur)  # 14/10: filtro BTC en contra (sombra)
 
     conn.commit()
     conn.close()
@@ -598,14 +599,15 @@ def guardar_candidatos_v55_ciclo(candidatos_ordenados: list):
             1 if c.get("bloqueado_btc_macro") else 0,
             1 if c.get("bloqueado_btc_ema_legacy") else 0,
             c.get("btc_giro_ratio"),
+            c.get("btc_ret3h_pct"), c.get("filtro_btc_contra"),
         )
         for i, c in enumerate(candidatos_ordenados, start=1)
     ]
     cur.executemany("""
         INSERT INTO candidatos_v55_ciclo
             (ciclo_ts, fecha, hora, par, direccion, rsi_15m, score, posicion, ejecutado, precio, seguimiento_activo, creado, bloqueado_btc_macro,
-             bloqueado_btc_ema_legacy, btc_giro_ratio)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+             bloqueado_btc_ema_legacy, btc_giro_ratio, btc_ret3h_pct, filtro_btc_contra)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     """, filas)
     conn.commit()
     conn.close()
@@ -643,6 +645,44 @@ def _migrar_extremos_mae_mfe(cur):
                 cur.execute(f"ALTER TABLE {tabla} ADD COLUMN {nombre} {tipo}")
             except Exception:
                 pass  # ya existe
+
+
+TABLAS_CON_FILTRO_BTC = ("senales", "simulaciones_v55", "sombra_ranked_v55", "candidatos_v55_ciclo")
+
+
+def _migrar_filtro_btc_contra(cur):
+    """
+    14/10 — Filtro "BTC en contra" EN SOMBRA. Guarda en cada candidato / simulacion /
+    operacion real: btc_ret3h_pct (variacion de BTC, ultimas 3 velas 1h cerradas) y
+    filtro_btc_contra (1 = el filtro lo habria bloqueado, 0 = no, NULL = sin dato o fila
+    anterior a este cambio). No modifica ninguna decision del bot.
+    """
+    for tabla in TABLAS_CON_FILTRO_BTC:
+        for nombre, tipo in (("btc_ret3h_pct", "REAL"), ("filtro_btc_contra", "INTEGER")):
+            try:
+                cur.execute(f"ALTER TABLE {tabla} ADD COLUMN {nombre} {tipo}")
+            except Exception:
+                pass  # ya existe
+
+
+def resumen_filtro_btc_contra() -> dict:
+    """Resultado de las operaciones CERRADAS con el flag del filtro registrado, por tabla."""
+    conn = _conn()
+    cur = conn.cursor()
+    out = {}
+    consultas = {
+        "real": "SELECT resultado_pct, filtro_btc_contra, fecha FROM senales WHERE registrado_pionex = 1 AND cerrado = 1 AND resultado_pct IS NOT NULL AND filtro_btc_contra IS NOT NULL",
+        "fiel": "SELECT resultado_pct, filtro_btc_contra, fecha FROM simulaciones_v55 WHERE cerrado = 1 AND resultado_pct IS NOT NULL AND filtro_btc_contra IS NOT NULL",
+    }
+    for k, sql in consultas.items():
+        try:
+            cur.execute(sql)
+            filas = [dict(r) for r in cur.fetchall()]
+        except Exception:
+            filas = []
+        out[k] = filas
+    conn.close()
+    return out
 
 
 def actualizar_extremos_sim(tabla: str, fila: dict, resultado_actual: float):
@@ -863,12 +903,14 @@ def abrir_sombra_ranked_v55_lote(candidatos_ordenados: list, top: int = TOP_SOMB
         filas.append((
             ciclo_ts, fecha, hora, par, c.get("direccion"), i,
             c.get("fuerza_score_v55"), c.get("rsi_15m"), c.get("precio"), capital_asignado, ciclo_ts,
+            c.get("btc_ret3h_pct"), c.get("filtro_btc_contra"),
         ))
     if filas:
         cur.executemany("""
             INSERT INTO sombra_ranked_v55
-                (ciclo_ts, fecha, hora, par, direccion, posicion, score, rsi_15m, precio_entrada, capital_asignado, creado)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                (ciclo_ts, fecha, hora, par, direccion, posicion, score, rsi_15m, precio_entrada, capital_asignado, creado,
+                 btc_ret3h_pct, filtro_btc_contra)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, filas)
         conn.commit()
     conn.close()
@@ -1376,15 +1418,17 @@ def par_tiene_simulacion_v55_abierta(par: str) -> bool:
     return n > 0
 
 
-def crear_simulacion_v55(par, direccion, score, adx, atr_pct, precio_entrada) -> int:
+def crear_simulacion_v55(par, direccion, score, adx, atr_pct, precio_entrada, btc_ret3h_pct=None, filtro_btc_contra=None) -> int:
     conn = _conn()
     cur = conn.cursor()
     ahora = datetime.now(TZ_ARG)
     capital_asignado = _capital_asignado_estimado()
     cur.execute("""
-        INSERT INTO simulaciones_v55 (par, direccion, score, adx, atr_pct, precio_entrada, capital_asignado, fecha, hora, creado)
-        VALUES (?,?,?,?,?,?,?,?,?,?)
-    """, (par, direccion, score, adx, atr_pct, precio_entrada, capital_asignado, ahora.strftime("%Y%m%d"), ahora.strftime("%H:%M"), ahora.isoformat()))
+        INSERT INTO simulaciones_v55 (par, direccion, score, adx, atr_pct, precio_entrada, capital_asignado, fecha, hora, creado,
+                                      btc_ret3h_pct, filtro_btc_contra)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+    """, (par, direccion, score, adx, atr_pct, precio_entrada, capital_asignado, ahora.strftime("%Y%m%d"), ahora.strftime("%H:%M"), ahora.isoformat(),
+          btc_ret3h_pct, filtro_btc_contra))
     conn.commit()
     sim_id = cur.lastrowid
     conn.close()
@@ -1710,8 +1754,8 @@ def guardar_senal(r: dict) -> int:
             adx, adx_umbral_usado, di_confirma, ema4h_alineada, funding_rate, funding_bloqueo,
             score, score_momentum, razones,
             precio_entrada, atr_pct, rango_pct, rango_bajo, rango_alto, grillas,
-            creado
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            creado, btc_ret3h_pct, filtro_btc_contra
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     """, (
         r["par"], r["direccion"], ahora.strftime("%Y%m%d"), ahora.strftime("%H:%M"),
         r.get("adx"), r.get("adx_umbral_usado"), int(r.get("di_confirma", False)),
@@ -1719,6 +1763,7 @@ def guardar_senal(r: dict) -> int:
         r["score"], r.get("score_momentum"), razones_json,
         r.get("precio"), r.get("atr_pct"), r.get("rango_pct"), r.get("rango_bajo"), r.get("rango_alto"),
         r.get("grillas"), ahora.isoformat(),
+        r.get("btc_ret3h_pct"), r.get("filtro_btc_contra"),
     ))
     conn.commit()
     senal_id = cur.lastrowid

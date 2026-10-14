@@ -584,7 +584,15 @@ def analizar_btc(con_giro: bool = True):
     giro = evaluar_giro_brusco_btc() if con_giro else {}
     df = get_velas("BTCUSDT", "1h", 100)
     if df is None:
-        return {"estado": "SIN_DATO", "cambio_1h_pct": 0, "cambio_reciente": False, "persistio_3": False, **giro}
+        return {"estado": "SIN_DATO", "cambio_1h_pct": 0, "cambio_reciente": False, "persistio_3": False,
+                "ret3_pct": None, **giro}
+    # 14/10 — variacion de BTC en las ultimas 3 velas de 1h CERRADAS (la ultima fila es la vela en formacion).
+    # Solo registro (filtro en sombra): no cambia ninguna decision.
+    try:
+        _cerr = df["close"].iloc[:-1].astype(float)
+        ret3_pct = round(float(_cerr.iloc[-1] / _cerr.iloc[-4] - 1) * 100, 3)
+    except Exception:
+        ret3_pct = None
     ema9_serie = df["close"].ewm(span=9).mean()
     ema21_serie = df["close"].ewm(span=21).mean()
     ema9 = float(ema9_serie.iloc[-1])
@@ -606,7 +614,7 @@ def analizar_btc(con_giro: bool = True):
     persistio_3 = bool((np.sign(diff_serie.iloc[-3:]) == signo_ahora).all())
 
     return {"estado": estado, "cambio_1h_pct": round(cambio_1h_pct, 3),
-            "cambio_reciente": cambio_reciente, "persistio_3": persistio_3, **giro}
+            "cambio_reciente": cambio_reciente, "persistio_3": persistio_3, "ret3_pct": ret3_pct, **giro}
 
 
 def actualizar_modo_cauto_btc(btc: dict):
@@ -719,6 +727,14 @@ def analizar_par_v5(par: str, btc: dict):
     candado_btc_activo = bool(btc and btc.get("giro_brusco") is True)
     bloqueado_btc_macro = candado_btc_activo
 
+    # 14/10 — Filtro "BTC en contra" EN SOMBRA: no bloquea, solo registra (ver gestion_riesgo.FILTRO_BTC_CONTRA_3H_PCT)
+    btc_ret3h_pct = (btc or {}).get("ret3_pct")
+    if btc_ret3h_pct is None:
+        filtro_btc_contra = None  # sin dato: no se puede evaluar
+    else:
+        _a_favor_3h = btc_ret3h_pct * (1 if direccion == "LARGO" else -1)
+        filtro_btc_contra = 1 if _a_favor_3h <= -gestion_riesgo.FILTRO_BTC_CONTRA_3H_PCT else 0
+
     # Persistencia (se mantiene, sin cambios respecto al diseño anterior)
     ema9_serie = df1h["close"].ewm(span=9).mean()
     ema21_serie = df1h["close"].ewm(span=21).mean()
@@ -776,6 +792,7 @@ def analizar_par_v5(par: str, btc: dict):
         "bloqueado_btc_macro": bloqueado_btc_macro,  # 28/09 — Candado de Tendencia Macro (07/10: solo con giro brusco de BTC)
         "bloqueado_btc_ema_legacy": bloqueado_btc_ema_legacy,  # 07/10 — lo que habría vetado la regla vieja, sin filtro
         "btc_giro_ratio": (btc or {}).get("giro_ratio"),
+        "btc_ret3h_pct": btc_ret3h_pct, "filtro_btc_contra": filtro_btc_contra,  # 14/10 — filtro en sombra
         "score": 10, "razones": [f"V5.0: ADX(1h)={round(adx,1)} RSI(15m)={round(rsi_15m,1)}"],
         "rango_pct": grid["rango_pct"], "rango_bajo": round(grid["bottom"], 6),
         "rango_alto": round(grid["top"], 6), "grillas": grid["grillas"],
@@ -1184,7 +1201,9 @@ def ciclo_seleccion():
             lugar_sim = gestion_riesgo.hay_lugar_para_abrir_v55()
             if lugar_sim["hay_lugar"]:
                 db.crear_simulacion_v55(par, candidato_v55["direccion"], candidato_v55.get("score"),
-                                         candidato_v55.get("adx"), candidato_v55.get("atr_pct"), candidato_v55["precio"])
+                                         candidato_v55.get("adx"), candidato_v55.get("atr_pct"), candidato_v55["precio"],
+                                         btc_ret3h_pct=candidato_v55.get("btc_ret3h_pct"),
+                                         filtro_btc_contra=candidato_v55.get("filtro_btc_contra"))
 
         if not pausado and not db.par_tiene_posicion_abierta(par):
             if not (modo_cauto_activo and db.contar_posiciones_por_direccion(candidato_v55["direccion"]) >= 3):
