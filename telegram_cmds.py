@@ -731,35 +731,49 @@ def _cmd_candidatos_v55() -> str:
 
 def _cmd_filtro_btc() -> str:
     """
-    14/10 — Filtro "BTC en contra" EN SOMBRA (no bloquea nada). Compara, sobre las
+    14/10 — Filtros "BTC en contra" EN SOMBRA (no bloquean nada). Compara, sobre las
     operaciones CERRADAS desde que se instalo el registro, el resultado real/fiel
-    con y sin el filtro (puntos de suma de resultados, igual que el informe de
-    comparacion). Bloqueada = BTC se movio >= 0.7% en contra de la direccion del
-    trade en las ultimas 3 velas de 1h cerradas.
+    con y sin cada filtro (puntos de suma de resultados, igual que el informe de
+    comparacion).
+      A) 1h: BTC se movio >= 0.7% en contra en las ultimas 3 velas de 1h cerradas.
+      B) 15m (15/10): BTC rebota >= 1.0% en contra desde el extremo de las ultimas 2h (8 velas de 15m).
+      C) cualquiera de los dos (solo filas que tienen ambos flags).
     """
     datos = db.resumen_filtro_btc_contra()
-    umbral = gestion_riesgo.FILTRO_BTC_CONTRA_3H_PCT
-    lineas = [f"🧪 <b>Filtro BTC en contra (sombra)</b> — umbral {umbral}% en 3h"]
-    hay = False
+    u1 = gestion_riesgo.FILTRO_BTC_CONTRA_3H_PCT
+    u2 = gestion_riesgo.FILTRO_BTC_REB2H_PCT
+    lineas = ["🧪 <b>Filtros BTC en contra (sombra)</b>"]
+    sl = lambda xs: sum(1 for x in xs if x <= -20)
+    wr = lambda xs: (100 * sum(1 for x in xs if x > 0) / len(xs)) if xs else 0
+    esquemas = (
+        ("A) 1h ≥{u1}% en 3h".format(u1=u1), lambda f: f.get("filtro_btc_contra"), None),
+        ("B) 15m rebote ≥{u2}% en 2h".format(u2=u2), lambda f: f.get("filtro_btc_reb2h"), None),
+        ("C) A o B", None, True),
+    )
     for clave, nombre in (("real", "🔴 Real"), ("fiel", "👻 V5.5 fiel")):
-        filas = datos.get(clave) or []
-        if not filas:
-            lineas.append(f"{nombre}: todavía sin operaciones cerradas con el registro.")
-            continue
-        hay = True
-        bloq = [f["resultado_pct"] for f in filas if f["filtro_btc_contra"] == 1]
-        libres = [f["resultado_pct"] for f in filas if f["filtro_btc_contra"] == 0]
-        total = sum(f["resultado_pct"] for f in filas)
-        sl = lambda xs: sum(1 for x in xs if x <= -20)
-        wr = lambda xs: (100 * sum(1 for x in xs if x > 0) / len(xs)) if xs else 0
-        lineas.append(
-            f"{nombre}: n={len(filas)} | resultado actual {total:+.1f}\n"
-            f"  🚫 Habría bloqueado {len(bloq)} (suma {sum(bloq):+.1f}, SL {sl(bloq)}, win {wr(bloq):.0f}%)\n"
-            f"  ✅ Habría dejado {len(libres)} (suma {sum(libres):+.1f}, SL {sl(libres)}, win {wr(libres):.0f}%)\n"
-            f"  👉 Con filtro: {sum(libres):+.1f} (mejora {-sum(bloq):+.1f})"
-        )
-    lineas.append("Puntos = suma simple de resultados por operación (≈ 5% del capital por operación). "
-                  "Muestra chica: esperar al menos 20-30 operaciones bloqueadas antes de decidir.")
+        todas = datos.get(clave) or []
+        lineas.append(f"\n<b>{nombre}</b>")
+        for titulo, getter, es_union in esquemas:
+            if es_union:
+                filas = [f for f in todas if f.get("filtro_btc_contra") is not None and f.get("filtro_btc_reb2h") is not None]
+                marca = lambda f: 1 if (f["filtro_btc_contra"] == 1 or f["filtro_btc_reb2h"] == 1) else 0
+            else:
+                filas = [f for f in todas if getter(f) is not None]
+                marca = lambda f, g=getter: g(f)
+            if not filas:
+                lineas.append(f"{titulo}: sin operaciones cerradas aún.")
+                continue
+            bloq = [f["resultado_pct"] for f in filas if marca(f) == 1]
+            libres = [f["resultado_pct"] for f in filas if marca(f) == 0]
+            total = sum(f["resultado_pct"] for f in filas)
+            lineas.append(
+                f"{titulo}: n={len(filas)} (actual {total:+.1f})\n"
+                f"  🚫 bloquea {len(bloq)}: suma {sum(bloq):+.1f}, SL {sl(bloq)}, win {wr(bloq):.0f}%\n"
+                f"  ✅ deja {len(libres)}: suma {sum(libres):+.1f}, SL {sl(libres)}, win {wr(libres):.0f}%\n"
+                f"  👉 con filtro {sum(libres):+.1f} (mejora {-sum(bloq):+.1f})"
+            )
+    lineas.append("\nPuntos = suma simple por operación (≈ 5% del capital). B y C cuentan solo desde su instalación (15/10); "
+                  "esperar ≥20-30 operaciones bloqueadas antes de decidir.")
     return "\n".join(lineas)
 
 
@@ -1008,7 +1022,7 @@ def procesar_comando(texto: str) -> str:
             "/seguimiento_v55 [sl] [N] — cómo siguió cotizando cada par 12hs después del cierre de "
             "V5.5 fiel (checkpoints 1/2/4/6/8/12hs). \"sl\" filtra solo las que cerraron por stop_loss "
             "(sin corchetes al escribir el número). Ej: /seguimiento_v55 sl 20\n"
-            "/filtro_btc — filtro 'BTC en contra' en sombra: qué habría pasado con y sin filtro (Real y fiel)\n"
+            "/filtro_btc — filtros 'BTC en contra' en sombra (1h y 15m): qué habría pasado con y sin filtro (Real y fiel)\n"
             "/candidatos_v55 — ranking completo del último ciclo de V5.5 (ejecutados ✅ y "
             "descartados ▫️), con RSI(15m) y score\n"
             "/informe_candidatos [FECHA [FECHA_HASTA]|todo] — calidad real de candidatos por "

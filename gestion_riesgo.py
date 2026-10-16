@@ -43,6 +43,12 @@ BTC_GIRO_ATR_MULT = 2.5
 # cerradas (corto tras suba de BTC, largo tras baja). Hipotesis a validar con datos
 # reales: ver /filtro_btc. Para ACTIVARLO habria que usar el flag en aplicar_ranking_v55.
 FILTRO_BTC_CONTRA_3H_PCT = 0.7
+# 15/10 — SEGUNDO FILTRO EN SOMBRA "BTC rebota en contra (15m, 2h)": marca un candidato si, mirando las
+# ultimas 8 velas de 15m CERRADAS de BTC (2h), el cierre se alejo >= este % del extremo previo EN CONTRA de la
+# direccion del trade (corto: BTC subio desde el minimo de las 2h; largo: BTC cayo desde el maximo de las 2h).
+# Estudio 22 dias (24/09-15/10): mejora en entrenamiento y test, Real y Fiel. Solo registra; no bloquea nada.
+FILTRO_BTC_REB2H_PCT = 1.0
+FILTRO_BTC_REB2H_VELAS = 8
 # Puesto máximo del ranking que puede abrir con capital real. Nunca se rellena
 # con puestos inferiores cuando el candado veta a uno de los dos primeros.
 MAX_PUESTO_REAL = 2

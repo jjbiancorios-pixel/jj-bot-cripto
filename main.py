@@ -533,7 +533,8 @@ def evaluar_giro_brusco_btc() -> dict:
     También se guarda el ratio con el rango (high-low) solo informativo.
     """
     vacio = {"giro_brusco": None, "giro_ratio": None, "giro_ratio_rango": None, "giro_direccion": None, "giro_motivo": None,
-             "atr15_pct": None, "mov_cerrada_pct": None, "mov_actual_pct": None}
+             "atr15_pct": None, "mov_cerrada_pct": None, "mov_actual_pct": None,
+             "reb_max2h": None, "reb_min2h": None, "reb_cierre": None}
     try:
         periodo = gestion_riesgo.BTC_GIRO_ATR_PERIODO
         df = get_velas("BTCUSDT", gestion_riesgo.BTC_GIRO_TF, 60)
@@ -554,6 +555,11 @@ def evaluar_giro_brusco_btc() -> dict:
         ratio_rango = max(rango_cerr, rango_act) / atr
         dominante = v_cerr if cuerpo_cerr >= cuerpo_act else v_act
         direccion = "ABAJO" if float(dominante["close"]) < float(dominante["open"]) else "ARRIBA"
+        # 15/10 — insumo del 2do filtro en sombra (rebote contra, 15m x 2h): extremos de las ultimas N velas CERRADAS
+        _n = gestion_riesgo.FILTRO_BTC_REB2H_VELAS
+        _u = cerradas.iloc[-_n:]
+        reb_max2h = float(_u["high"].max())
+        reb_min2h = float(_u["low"].min())
         # 07/10 — el peligro se define SOLO por el signo de la vela que disparó:
         # cierre < apertura = riesgo de caída generalizada; cierre > apertura =
         # riesgo de short-squeeze o volatilidad extrema.
@@ -568,6 +574,7 @@ def evaluar_giro_brusco_btc() -> dict:
             "atr15_pct": round(atr / precio * 100, 4),
             "mov_cerrada_pct": round(cuerpo_cerr / precio * 100, 4),
             "mov_actual_pct": round(cuerpo_act / precio * 100, 4),
+            "reb_max2h": reb_max2h, "reb_min2h": reb_min2h, "reb_cierre": precio,
         }
     except Exception as e:
         print(f"evaluar_giro_brusco_btc: {e}", flush=True)
@@ -735,6 +742,17 @@ def analizar_par_v5(par: str, btc: dict):
         _a_favor_3h = btc_ret3h_pct * (1 if direccion == "LARGO" else -1)
         filtro_btc_contra = 1 if _a_favor_3h <= -gestion_riesgo.FILTRO_BTC_CONTRA_3H_PCT else 0
 
+    # 15/10 — 2do filtro EN SOMBRA: rebote de BTC en contra, velas de 15m, ventana 2h (no bloquea, solo registra).
+    # btc_reb2h_pct: % que BTC se alejo del extremo en contra (positivo = en contra del trade); flag=1 si >= umbral.
+    btc_reb2h_pct, filtro_btc_reb2h = None, None
+    try:
+        _c, _mx, _mn = (btc or {}).get("reb_cierre"), (btc or {}).get("reb_max2h"), (btc or {}).get("reb_min2h")
+        if _c and _mx and _mn:
+            btc_reb2h_pct = round(((1 - _c / _mx) if direccion == "LARGO" else (_c / _mn - 1)) * 100, 3)
+            filtro_btc_reb2h = 1 if btc_reb2h_pct >= gestion_riesgo.FILTRO_BTC_REB2H_PCT else 0
+    except Exception:
+        btc_reb2h_pct, filtro_btc_reb2h = None, None
+
     # Persistencia (se mantiene, sin cambios respecto al diseño anterior)
     ema9_serie = df1h["close"].ewm(span=9).mean()
     ema21_serie = df1h["close"].ewm(span=21).mean()
@@ -793,6 +811,7 @@ def analizar_par_v5(par: str, btc: dict):
         "bloqueado_btc_ema_legacy": bloqueado_btc_ema_legacy,  # 07/10 — lo que habría vetado la regla vieja, sin filtro
         "btc_giro_ratio": (btc or {}).get("giro_ratio"),
         "btc_ret3h_pct": btc_ret3h_pct, "filtro_btc_contra": filtro_btc_contra,  # 14/10 — filtro en sombra
+        "btc_reb2h_pct": btc_reb2h_pct, "filtro_btc_reb2h": filtro_btc_reb2h,  # 15/10 — 2do filtro en sombra
         "score": 10, "razones": [f"V5.0: ADX(1h)={round(adx,1)} RSI(15m)={round(rsi_15m,1)}"],
         "rango_pct": grid["rango_pct"], "rango_bajo": round(grid["bottom"], 6),
         "rango_alto": round(grid["top"], 6), "grillas": grid["grillas"],
@@ -1203,7 +1222,9 @@ def ciclo_seleccion():
                 db.crear_simulacion_v55(par, candidato_v55["direccion"], candidato_v55.get("score"),
                                          candidato_v55.get("adx"), candidato_v55.get("atr_pct"), candidato_v55["precio"],
                                          btc_ret3h_pct=candidato_v55.get("btc_ret3h_pct"),
-                                         filtro_btc_contra=candidato_v55.get("filtro_btc_contra"))
+                                         filtro_btc_contra=candidato_v55.get("filtro_btc_contra"),
+                                         btc_reb2h_pct=candidato_v55.get("btc_reb2h_pct"),
+                                         filtro_btc_reb2h=candidato_v55.get("filtro_btc_reb2h"))
 
         if not pausado and not db.par_tiene_posicion_abierta(par):
             if not (modo_cauto_activo and db.contar_posiciones_por_direccion(candidato_v55["direccion"]) >= 3):
