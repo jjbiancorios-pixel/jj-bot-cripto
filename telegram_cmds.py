@@ -12,6 +12,7 @@ Comandos:
   /probar_pionex PAR PRECIO [LEVERAGE] [CAPITAL]
   /backup_db     — manda la base completa comprimida (.gz); '/backup_db liviano' = sin gates_log
   /diagnostico_db — qué ocupa espacio en el Volume (solo lectura)
+  /velas [15m|1h|4h] [días] — zip con velas de Binance de las monedas del bot (solo lectura)
   /gates PAR     — últimos chequeos de gates para un par (diagnóstico)
   /ayuda
 """
@@ -281,6 +282,85 @@ def _cmd_backup_db(args=None) -> str:
         return f"⚠️ Error: {e}"
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def _cmd_velas(args=None) -> str:
+    """
+    17/10 — /velas [TF] [DIAS] : SOLO LECTURA. Baja velas historicas de Binance (data-api.binance.vision, el mismo
+    origen que ya usa el bot) de las monedas que el bot mas evaluo + BTC/ETH y las manda por Telegram en un .zip
+    (un CSV por moneda). No toca la base ni ninguna operacion. Sirve para probar reglas de entrada sobre meses de
+    historia en vez de los pocos dias que guarda la base.
+      /velas            -> 1h, 80 dias, hasta 40 monedas
+      /velas 1h 60      -> 1h, 60 dias
+      /velas 15m 20     -> 15m, 20 dias (tope 30)
+    CSV: apertura_utc_ms, open, high, low, close, volumen, cierre_utc_ms, volumen_usdt, trades
+    """
+    import io, time, zipfile, sqlite3
+    tf = "1h"; dias = 80
+    for a in (args or []):
+        a = a.lower()
+        if a in ("15m", "1h", "4h"):
+            tf = a
+        else:
+            try:
+                dias = int(a)
+            except ValueError:
+                return "⚠️ Uso: /velas [15m|1h|4h] [días]"
+    ms_tf = {"15m": 900000, "1h": 3600000, "4h": 14400000}[tf]
+    dias = max(1, min(dias, 30 if tf == "15m" else 200))
+    total = int(dias * 86400000 / ms_tf)
+    pares = ["BTCUSDT", "ETHUSDT"]
+    try:
+        conn = sqlite3.connect(f"file:{db.DB_PATH}?mode=ro", uri=True, timeout=30)
+        filas = conn.execute(
+            "SELECT par, COUNT(*) n FROM (SELECT par FROM candidatos_v55_ciclo UNION ALL SELECT par FROM simulaciones_v55 "
+            "UNION ALL SELECT par FROM senales) GROUP BY par ORDER BY n DESC LIMIT 40").fetchall()
+        conn.close()
+        for par, _n in filas:
+            if par and par not in pares:
+                pares.append(par)
+    except Exception as e:
+        return f"⚠️ No pude leer la lista de monedas de la base: {e}"
+    enviar(f"⏳ Bajando velas {tf} de {dias} días para {len(pares)} monedas (puede tardar ~1 min)...")
+    buf = io.BytesIO()
+    ok, fallidas = [], []
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for par in pares:
+            filas_k, end = [], None
+            try:
+                while len(filas_k) < total:
+                    url = f"https://data-api.binance.vision/api/v3/klines?symbol={par}&interval={tf}&limit=1000"
+                    if end:
+                        url += f"&endTime={end}"
+                    data = requests.get(url, timeout=10).json()
+                    if not isinstance(data, list) or not data:
+                        break
+                    filas_k = data + filas_k
+                    end = data[0][0] - 1
+                    time.sleep(0.15)
+                    if len(data) < 1000:
+                        break
+                if len(filas_k) < 50:
+                    raise ValueError("pocas velas")
+                filas_k = filas_k[-total:]
+                csv = "\n".join(",".join(str(x) for x in (k[0], k[1], k[2], k[3], k[4], k[5], k[6], k[7], k[8])) for k in filas_k)
+                zf.writestr(f"{par}-{tf}.csv", csv + "\n")
+                ok.append(par)
+            except Exception:
+                fallidas.append(par)
+    if not ok:
+        return "⚠️ No pude bajar velas de ninguna moneda (¿Binance no responde desde el servidor?)."
+    datos = buf.getvalue()
+    if len(datos) > 49 * 1024 * 1024:
+        return f"⚠️ El zip pesa {len(datos)/1048576:.1f} MB (límite 50 MB). Probá con menos días."
+    fecha = datetime.now(db.TZ_ARG).strftime("%Y%m%d_%H%M")
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendDocument"
+    files = {"document": (f"velas_{tf}_{dias}d_{fecha}.zip", datos, "application/zip")}
+    cap = f"📈 Velas {tf} — {len(ok)} monedas, {dias} días ({len(datos)/1048576:.1f} MB)." + (f" Sin datos: {', '.join(fallidas)}" if fallidas else "")
+    r = requests.post(url, data={"chat_id": CHAT_ID, "caption": cap[:1000]}, files=files, timeout=180)
+    if not r.json().get("ok"):
+        return f"⚠️ Falló el envío: {r.json()}"
+    return None
 
 
 def _cmd_diagnostico_db() -> str:
@@ -976,6 +1056,8 @@ def procesar_comando(texto: str) -> str:
         return _cmd_diagnostico_apertura()
     elif cmd == "/backup_db":
         return _cmd_backup_db(args)
+    elif cmd == "/velas":
+        return _cmd_velas(args)
     elif cmd == "/diagnostico_db":
         return _cmd_diagnostico_db()
     elif cmd == "/gates":
@@ -1048,7 +1130,8 @@ def procesar_comando(texto: str) -> str:
             "/reanudar_todo\n"
             "/probar_pionex PAR PRECIO — prueba conexión sin crear orden real\n"
             "/backup_db — base completa comprimida (.gz)\n/backup_db liviano — sin gates_log (más chica)\n"
-            "/diagnostico_db — qué ocupa espacio en el Volume (solo lectura)"
+            "/diagnostico_db — qué ocupa espacio en el Volume (solo lectura)\n"
+            "/velas [15m|1h|4h] [días] — manda un .zip con velas de Binance de las monedas del bot (solo lectura)"
         )
     return f"⚠️ No reconozco el comando \"{cmd}\" — mandá /ayuda para ver la lista."
 
